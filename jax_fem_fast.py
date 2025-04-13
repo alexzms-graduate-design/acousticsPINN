@@ -149,13 +149,16 @@ def element_matrices_solid(nodes_elem: jnp.ndarray, E: float, nu: float,
 # -------------------------
 @partial(jax.jit, static_argnames=('element_func', 'dof_per_node'))
 def assemble_global_system(nodes: jnp.ndarray, elements: jnp.ndarray, element_func, 
-                          omega: float, E=None, nu=None, rho_s=None, dof_per_node: int = 1):
+                          omega: float, E=None, nu=None, rho_s=None, dof_per_node: int = 1,
+                          source_indices: jnp.ndarray = None, source_value: float = 0.0):
     """
     向量化全局矩阵组装：使用vmap批处理单元计算
     """
     n_nodes = nodes.shape[0]
     n_dof = n_nodes * dof_per_node
     A_global = jnp.zeros((n_dof, n_dof))
+    f_global = jnp.zeros(n_dof)
+
     
     # 批处理计算所有单元矩阵
     def compute_element_matrix(elem):
@@ -173,7 +176,18 @@ def assemble_global_system(nodes: jnp.ndarray, elements: jnp.ndarray, element_fu
         return A_acc.at[jnp.ix_(indices, indices)].add(A_e), None
     
     A_global, _ = jax.lax.scan(scatter, A_global, (elements, all_A_e))
-    return A_global, jnp.zeros(n_dof)
+    
+    # 添加声源激励（仅流体域）
+    if source_indices is not None and dof_per_node == 1:
+        dirichlet_penalty = 1e12
+        def apply_dirichlet(A_f, f_f, idx):
+            A_f = A_f.at[idx, :].set(0.0)
+            A_f = A_f.at[idx, idx].set(dirichlet_penalty)
+            f_f = f_f.at[idx].set(dirichlet_penalty * source_value)
+            return A_f, f_f
+        for idx in source_indices:
+            A_global, f_global = apply_dirichlet(A_global, f_global, idx)
+    return A_global, f_global
 
 # -------------------------
 # 6. 流固耦合矩阵组装（向量化惩罚项）
@@ -181,12 +195,16 @@ def assemble_global_system(nodes: jnp.ndarray, elements: jnp.ndarray, element_fu
 @partial(jax.jit, static_argnames=('E', 'nu', 'rho_s'))
 def assemble_coupling_system(nodes: jnp.ndarray, fluid_elements: jnp.ndarray, solid_elements: jnp.ndarray,
                              omega: float, E: float, nu: float, rho_s: float, 
-                             interface_indices: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+                             interface_indices: jnp.ndarray, source_indices: jnp.ndarray = None, source_value: float = 0.0) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     向量化处理流固耦合惩罚项
     """
     # 组装基础矩阵
-    A_fluid, _ = assemble_global_system(nodes, fluid_elements, element_matrices_fluid, omega, dof_per_node=1)
+    A_fluid, f_fluid = assemble_global_system(
+        nodes, fluid_elements, element_matrices_fluid, omega, 
+        dof_per_node=1, source_indices=source_indices, source_value=source_value
+    )
+
     A_solid, _ = assemble_global_system(nodes, solid_elements, element_matrices_solid, omega, E, nu, rho_s, dof_per_node=3)
     A_global = jnp.block([[A_fluid, jnp.zeros((A_fluid.shape[0], A_solid.shape[1]))],
                           [jnp.zeros((A_solid.shape[0], A_fluid.shape[1])), A_solid]])
@@ -224,9 +242,9 @@ def assemble_coupling_system(nodes: jnp.ndarray, fluid_elements: jnp.ndarray, so
 # 7. 全局系统求解（保持原始接口）
 # -------------------------
 @jax.jit
-def solve_fsi_system(E: float, nu: float, rho_s: float, omega: float, mesh_data):
+def solve_fsi_system(E: float, nu: float, rho_s: float, omega: float, mesh_data, source_indices: jnp.ndarray = None, source_value: float = 0.0):
     nodes, elem_fluid, elem_solid, interface_indices = mesh_data
-    A_global, f_global = assemble_coupling_system(nodes, elem_fluid, elem_solid, omega, E, nu, rho_s, interface_indices)
+    A_global, f_global = assemble_coupling_system(nodes, elem_fluid, elem_solid, omega, E, nu, rho_s, interface_indices, source_indices, source_value)
     
     # 添加正则化项防止奇异矩阵
     A_regularized = A_global + 1e-6 * jnp.eye(A_global.shape[0])
@@ -248,8 +266,8 @@ def interpolate_pressure(u: jnp.ndarray, nodes: jnp.ndarray, mic_pos: jnp.ndarra
 # 9. 对外接口（JIT顶层封装）
 # -------------------------
 @jax.jit
-def forward_fsi(E: float, nu: float, rho_s: float, omega: float, mesh_data, mic_pos: jnp.ndarray) -> jnp.ndarray:
-    u = solve_fsi_system(E, nu, rho_s, omega, mesh_data)
+def forward_fsi(E: float, nu: float, rho_s: float, omega: float, mesh_data, mic_pos: jnp.ndarray, source_indices: jnp.ndarray = None, source_value: float = 0.0) -> jnp.ndarray:
+    u = solve_fsi_system(E, nu, rho_s, omega, mesh_data, source_indices, source_value)
     if EXIT_FUNC_PRINT:
         print(f"Exiting forward_fsi function...")
     return interpolate_pressure(u, mesh_data[0], mic_pos)

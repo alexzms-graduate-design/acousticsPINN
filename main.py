@@ -14,13 +14,17 @@ nodes, elem_fluid, elem_solid, interface_indices = load_mesh(MESH_FILE)
 mesh_data = (nodes, elem_fluid, elem_solid, interface_indices)
 
 # 激励频率 (rad/s): 例如，对于 1000Hz, omega = 2π*1000
-freq = 1000.0
+freq = 100.0
 omega = 2 * np.pi * freq
 
-# 声源位置：主管入口（x=0）的节点
-source_mask = (nodes[:, 0] == 0.0)  # 假设入口节点 x=0
-source_indices = jnp.nonzero(source_mask, size=1)[0]  # 选取第一个节点
-source_value = 1.0  # 激励幅值（Pa）
+# 定义入口激励：在流体域（dof_per_node==1）的入口节点 (x≈0) 固定 p=1.0 Pa
+nodes = np.array(mesh_data[0])  # 将 jax 数组转换为 NumPy 以便筛选
+tol_inlet = 1e-3
+source_mask = np.abs(nodes[:,0]) < tol_inlet
+source_indices = np.nonzero(source_mask)[0].astype(np.int32)
+source_indices = jnp.array(source_indices, dtype=jnp.int32)  # 转为 jax 数组
+print(f"source_indices: {source_indices}")  
+source_value = 1.0  # 单位 Pa
 
 # 远端麦克风位置 (远端位于主管中心点 x=1.0, y=0, z=0)
 mic_pos = jnp.array([1.0, 0.0, 0.0])
@@ -43,10 +47,10 @@ class JaxFEMMicPressure(torch.autograd.Function):
         nu_np = nu_t.detach().cpu().numpy()
         rho_np = rho_t.detach().cpu().numpy()
         # 调用 JAX FEM 正向函数 (已 JIT 编译)
-        p_pred = forward_fsi(float(E_np), float(nu_np), float(rho_np), omega, mesh_data, mic_pos)
+        p_pred = forward_fsi(float(E_np), float(nu_np), float(rho_np), omega, mesh_data, mic_pos, source_indices, source_value)
         # 获取梯度信息：使用 jax.value_and_grad
         def fem_obj(E_in, nu_in, rho_in):
-            return forward_fsi(E_in, nu_in, rho_in, omega, mesh_data, mic_pos)
+            return forward_fsi(E_in, nu_in, rho_in, omega, mesh_data, mic_pos, source_indices, source_value)
         # 求值和梯度（返回标量和对应梯度元组）
         print("Entering jax.value_and_grad...")
         p_val, grads = jax.value_and_grad(fem_obj, argnums=(0,1,2))(float(E_np), float(nu_np), float(rho_np))

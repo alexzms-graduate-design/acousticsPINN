@@ -49,14 +49,20 @@ def generate_y_pipe_mesh():
     gmsh.model.occ.synchronize()
     pipe_wall, _ = gmsh.model.occ.cut(outer_union, inner_union)
     
-    # -------------------------------
+    # 再次构建流体域
+    gmsh.model.occ.synchronize()
+    cylinder_fluid1 = gmsh.model.occ.addCylinder(0, 0, 0, length_main, 0, 0, r_inner)
+    cylinder_fluid2 = gmsh.model.occ.addCylinder(0.5, 0, 0, -dx, dy, 0, r_inner)
+    cylinder_fluid, _ = gmsh.model.occ.fuse([(3, cylinder_fluid1)], [(3, cylinder_fluid2)])
+
     # 定义物理组
     # 将管壁体定义为物理组 1，流体内腔（内并集）定义为物理组 2
     gmsh.model.occ.synchronize()
     gmsh.model.addPhysicalGroup(3, [pipe_wall[0][1]], tag=1)  # 管壁体
     gmsh.model.setPhysicalName(3, 1, "Pipe Wall")
     gmsh.model.occ.synchronize()
-    gmsh.model.addPhysicalGroup(3, [inner_union[0][1]], tag=2)  # 流体内腔
+    # 流体域
+    gmsh.model.addPhysicalGroup(3, [cylinder_fluid[0][1]], tag=2)
     gmsh.model.setPhysicalName(3, 2, "Fluid Domain")
     
     gmsh.model.occ.synchronize()
@@ -73,4 +79,8 @@ if __name__ == "__main__":
     import meshio
     mesh = meshio.read("y_pipe.msh")
     print(mesh.cell_data_dict.keys())
-    print(mesh.cell_data_dict)
+    print(f"cell_data_dict['gmsh:physical']['tetra'].shape: {mesh.cell_data_dict['gmsh:physical']['tetra'].shape}")
+    print(f"tetra shape(cells[0].data): {mesh.cells[0].data.shape}")
+    print(f"tetra shape(cells[1].data): {mesh.cells[1].data.shape}")
+    print(f"# of physics group=1: {len(mesh.cell_data_dict['gmsh:physical']['tetra'][mesh.cell_data_dict['gmsh:physical']['tetra'] == 1])}")
+    print(f"# of physics group=2: {len(mesh.cell_data_dict['gmsh:physical']['tetra'][mesh.cell_data_dict['gmsh:physical']['tetra'] == 2])}")

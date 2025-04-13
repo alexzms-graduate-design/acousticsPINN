@@ -23,24 +23,22 @@ def load_mesh(msh_file: str):
     mesh = meshio.read(msh_file)
     nodes = mesh.points[:, :3]  # 所有节点，shape (n_nodes,3)
     # 提取 tetrahedral 单元
-    tetra_cells = None
-    for cell in mesh.cells:
-        if cell.type == "tetra":
-            tetra_cells = cell.data
-            break
-    if tetra_cells is None:
-        raise ValueError("没有找到 tetrahedral 单元!")
-    # 提取物理标签数据（假设保存在 cell_data_dict["gmsh:physical"]["tetra"]）
-    phys_tags = mesh.cell_data_dict["gmsh:physical"]["tetra"]
-    fluid_list = []
-    solid_list = []
-    for i, tag in enumerate(phys_tags):
-        if tag == 1:
-            fluid_list.append(tetra_cells[i])
-        elif tag == 2:
-            solid_list.append(tetra_cells[i])
-    elements_fluid = np.array(fluid_list, dtype=np.int32)
-    elements_solid = np.array(solid_list, dtype=np.int32)
+    # tetra_cells = mesh.cells[0].data
+    # print(f"tetra_cells shape: {tetra_cells.shape}")
+    # # 提取物理标签数据（假设保存在 cell_data_dict["gmsh:physical"]["tetra"]）
+    # phys_tags = mesh.cell_data_dict["gmsh:physical"]["tetra"]
+    # print(tetra_cells)
+    # print(f"tetra_cells shape: {tetra_cells.shape}, phys_tags shape: {phys_tags.shape}, unique tags: {np.unique(phys_tags)}")
+    # fluid_list = []
+    # solid_list = []
+    # for i, tag in enumerate(phys_tags):
+    #     if tag == 1:
+    #         solid_list.append(tetra_cells[i])
+    #     elif tag == 2:
+    #         fluid_list.append(tetra_cells[i])
+    elements_fluid = np.array(mesh.cells[0].data, dtype=np.int32) # index = 0 -> tag = 1 -> solid
+    elements_solid = np.array(mesh.cells[1].data, dtype=np.int32) # index = 1 -> tag = 2 -> fluid
+    print(f"elements_fluid shape: {elements_fluid.shape}, elements_solid shape: {elements_solid.shape}")
     return jnp.array(nodes), jnp.array(elements_fluid), jnp.array(elements_solid)
 
 # -------------------------
@@ -167,7 +165,7 @@ def assemble_global_system(nodes: jnp.ndarray, elements: jnp.ndarray, element_fu
         indices = []
         for n in elem:
             for a in range(dof_per_node):
-                indices.append(int(n)*dof_per_node + a)
+                indices.append((n.astype(int))*dof_per_node + a)
         indices = jnp.array(indices)
         A_acc = A_acc.at[jnp.ix_(indices, indices)].add(A_e)
         return A_acc
@@ -202,13 +200,16 @@ def assemble_coupling_system(nodes: jnp.ndarray, fluid_elements: jnp.ndarray, so
     ])
     f_global = jnp.concatenate([f_fluid, f_solid], axis=0)
     # 边界耦合：确定流固界面节点
+    # IMPORTANT: this tolerance is used to determine the interface nodes.
     tol = 1e-3
     # 对于主管内表面，界面条件要求： |sqrt(y^2+z^2) - R_inner_main| < tol, 且 x in [x_main_min, x_main_max]
-    def is_interface(coord):
-        # coord: (x,y,z)
-        r = jnp.sqrt(coord[1]**2 + coord[2]**2)
+    # nodes 已经是一个 jax 数组，形状 (n_nodes, 3)
+    def interface_mask(nodes):
+        r = jnp.sqrt(nodes[:,1]**2 + nodes[:,2]**2)
         return jnp.abs(r - R_inner_main) < tol
-    interface_indices = jnp.where(jnp.array([is_interface(coord) for coord in np.array(nodes)]))[0]
+
+    interface_indices = jnp.nonzero(interface_mask(nodes))[0]
+    
     # 对每个界面节点，计算外侧法向量 n = (0, y/√(y²+z²), z/√(y²+z²))
     normals = []
     for i in interface_indices:
@@ -276,3 +277,5 @@ def forward_fsi(E: float, nu: float, rho_s: float, omega: float, mesh_data, mic_
     nodes, _, _ = mesh_data
     p_mic = interpolate_pressure(u, nodes, mic_pos)
     return p_mic
+
+

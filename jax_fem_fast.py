@@ -5,6 +5,12 @@ import meshio
 import numpy as np
 from typing import Tuple
 from functools import partial
+from jax import debug
+
+from jax.config import config
+config.update("jax_debug_nans", True)
+# float64
+config.update("jax_enable_x64", True)
 
 # 禁用调试打印以提升性能
 ENTER_FUNC_PRINT = False
@@ -29,6 +35,11 @@ def load_mesh(msh_file: str):
         print(f"Entering load_mesh function...")
     mesh = meshio.read(msh_file)
     nodes = mesh.points[:, :3]
+    
+    volumes = [tetra_volume(nodes[elem]) for elem in mesh.cells[0].data]
+    if any(v <= 0 for v in volumes):
+        raise ValueError("存在无效单元体积（≤0），请调整网格参数！")
+    
     elements_fluid = np.array(mesh.cells[0].data, dtype=np.int32)
     elements_solid = np.array(mesh.cells[1].data, dtype=np.int32)
     
@@ -64,6 +75,7 @@ def tetra_volume(nodes_elem: jnp.ndarray) -> jnp.ndarray:
     v2 = nodes_elem[2] - p0
     v3 = nodes_elem[3] - p0
     det_val = jnp.linalg.det(jnp.stack([v1, v2, v3], axis=1))
+    det_val = jnp.where(jnp.abs(det_val) < 1e-12, 1e-12, det_val)
     return jnp.abs(det_val) / 6.0
 
 # -------------------------
@@ -79,7 +91,8 @@ def element_matrices_fluid(nodes_elem: jnp.ndarray, omega: float) -> jnp.ndarray
     V = tetra_volume(nodes_elem)
     ones = jnp.ones((4, 1))
     A = jnp.concatenate([ones, nodes_elem], axis=1)
-    invA = jnp.linalg.inv(A)
+    A_reg = A + 1e-6 * jnp.eye(A.shape[0])  # 防止奇异矩阵
+    invA = jnp.linalg.inv(A_reg)
     grads = invA[1:4, :]
     K_e = jnp.dot(grads.T, grads) * V
     M_e = (V / 10.0) * (jnp.ones((4,4)) + jnp.eye(4))
@@ -214,7 +227,12 @@ def assemble_coupling_system(nodes: jnp.ndarray, fluid_elements: jnp.ndarray, so
 def solve_fsi_system(E: float, nu: float, rho_s: float, omega: float, mesh_data):
     nodes, elem_fluid, elem_solid, interface_indices = mesh_data
     A_global, f_global = assemble_coupling_system(nodes, elem_fluid, elem_solid, omega, E, nu, rho_s, interface_indices)
-    return jnp.linalg.solve(A_global, f_global)
+    
+    # 添加正则化项防止奇异矩阵
+    A_regularized = A_global + 1e-6 * jnp.eye(A_global.shape[0])
+    u = jnp.linalg.solve(A_regularized, f_global)
+    debug.callback(lambda x: print(f"Max displacement: {jnp.max(jnp.abs(x))}"), u)
+    return u
 
 # -------------------------
 # 8. 麦克风插值（纯JAX实现）

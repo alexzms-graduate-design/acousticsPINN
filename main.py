@@ -4,7 +4,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 import time
-from jax_fem import load_mesh, forward_fsi
+from jax_fem_fast import load_mesh, forward_fsi
 
 # -------------------------
 # 1. 基本参数与网格数据加载
@@ -16,6 +16,11 @@ mesh_data = (nodes, elem_fluid, elem_solid, interface_indices)
 # 激励频率 (rad/s): 例如，对于 1000Hz, omega = 2π*1000
 freq = 1000.0
 omega = 2 * np.pi * freq
+
+# 声源位置：主管入口（x=0）的节点
+source_mask = (nodes[:, 0] == 0.0)  # 假设入口节点 x=0
+source_indices = jnp.nonzero(source_mask, size=1)[0]  # 选取第一个节点
+source_value = 1.0  # 激励幅值（Pa）
 
 # 远端麦克风位置 (远端位于主管中心点 x=1.0, y=0, z=0)
 mic_pos = jnp.array([1.0, 0.0, 0.0])

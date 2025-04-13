@@ -4,7 +4,8 @@ import jax.numpy as jnp
 import meshio
 import numpy as np
 from typing import Tuple
-
+ENTER_FUNC_PRINT = True
+EXIT_FUNC_PRINT = True
 R_inner_main = 0.045  # 主管内半径，单位：米
 
 # -------------------------
@@ -20,26 +21,23 @@ def load_mesh(msh_file: str):
       elements_fluid: jnp.array shape (n_elem_fluid,4)   ——节点索引（0-based）
       elements_solid: jnp.array shape (n_elem_solid,4)
     """
+    if ENTER_FUNC_PRINT:
+        print(f"Entering load_mesh function...")
     mesh = meshio.read(msh_file)
-    nodes = mesh.points[:, :3]  # 所有节点，shape (n_nodes,3)
-    # 提取 tetrahedral 单元
-    # tetra_cells = mesh.cells[0].data
-    # print(f"tetra_cells shape: {tetra_cells.shape}")
-    # # 提取物理标签数据（假设保存在 cell_data_dict["gmsh:physical"]["tetra"]）
-    # phys_tags = mesh.cell_data_dict["gmsh:physical"]["tetra"]
-    # print(tetra_cells)
-    # print(f"tetra_cells shape: {tetra_cells.shape}, phys_tags shape: {phys_tags.shape}, unique tags: {np.unique(phys_tags)}")
-    # fluid_list = []
-    # solid_list = []
-    # for i, tag in enumerate(phys_tags):
-    #     if tag == 1:
-    #         solid_list.append(tetra_cells[i])
-    #     elif tag == 2:
-    #         fluid_list.append(tetra_cells[i])
-    elements_fluid = np.array(mesh.cells[0].data, dtype=np.int32) # index = 0 -> tag = 1 -> solid
-    elements_solid = np.array(mesh.cells[1].data, dtype=np.int32) # index = 1 -> tag = 2 -> fluid
-    print(f"elements_fluid shape: {elements_fluid.shape}, elements_solid shape: {elements_solid.shape}")
-    return jnp.array(nodes), jnp.array(elements_fluid), jnp.array(elements_solid)
+    nodes = mesh.points[:, :3]
+    # 提取四面体单元
+    elements_fluid = np.array(mesh.cells[0].data, dtype=np.int32)
+    elements_solid = np.array(mesh.cells[1].data, dtype=np.int32)
+    
+    # 预处理界面节点索引
+    tol = 1e-3 # 1mm
+    r = np.sqrt(nodes[:,1]**2 + nodes[:,2]**2)
+    interface_mask = np.abs(r - R_inner_main) < tol
+    interface_indices = np.nonzero(interface_mask)[0].astype(np.int32)
+    print(f"elements_fluid shape: {elements_fluid.shape}, elements_solid shape: {elements_solid.shape}, interface_indices shape: {interface_indices.shape}")
+    if EXIT_FUNC_PRINT:
+        print(f"Exiting load_mesh function...")
+    return jnp.array(nodes), jnp.array(elements_fluid), jnp.array(elements_solid), jnp.array(interface_indices, dtype=jnp.int32)
 
 # -------------------------
 # 2. 四面体单元基础计算
@@ -50,11 +48,15 @@ def tetra_volume(nodes_elem: jnp.ndarray) -> jnp.ndarray:
     Volume = 1/6 * abs(det([p1-p0, p2-p0, p3-p0]))
     nodes_elem: jnp.array shape (4,3)
     """
+    if ENTER_FUNC_PRINT:
+        print(f"Entering tetra_volume function...")
     p0 = nodes_elem[0]
     v1 = nodes_elem[1] - p0
     v2 = nodes_elem[2] - p0
     v3 = nodes_elem[3] - p0
     det_val = jnp.linalg.det(jnp.stack([v1, v2, v3], axis=1))
+    if EXIT_FUNC_PRINT:
+        print(f"Exiting tetra_volume function...")
     return jnp.abs(det_val) / 6.0
 
 # -------------------------
@@ -67,6 +69,8 @@ def element_matrices_fluid(nodes_elem: jnp.ndarray, omega: float) -> jnp.ndarray
     使用解析公式：梯度的形函数常数，刚度矩阵K_e = V * (B^T B), 质量矩阵M_e = (V/10)*(1+δ_ij)。
     返回单元矩阵 A_e = K_e - k² M_e, shape (4,4)
     """
+    if ENTER_FUNC_PRINT:
+        print(f"Entering element_matrices_fluid function...")
     V = tetra_volume(nodes_elem)
     # 构造增广矩阵 A = [1, x, y, z] (4x4)
     ones = jnp.ones((4, 1))
@@ -80,6 +84,8 @@ def element_matrices_fluid(nodes_elem: jnp.ndarray, omega: float) -> jnp.ndarray
     c = 343.0  # 声速, 单位 m/s（流体参数已知）
     k = omega / c
     A_e = K_e - (k**2) * M_e
+    if EXIT_FUNC_PRINT:
+        print(f"Exiting element_matrices_fluid function...")
     return A_e
 
 # -------------------------
@@ -101,6 +107,8 @@ def element_matrices_solid(nodes_elem: jnp.ndarray, E: float, nu: float, rho_s: 
     单元刚度： K_e = B^T D B * V, 单元一致质量矩阵 M_e 取自密度 ρₛ * V/4 分布于各节点。
     返回单元矩阵 A_e = K_e - ω² M_e, shape (12,12)
     """
+    if ENTER_FUNC_PRINT:
+        print(f"Entering element_matrices_solid function...")
     V = tetra_volume(nodes_elem)
     ones = jnp.ones((4,1))
     A_mat = jnp.concatenate([ones, nodes_elem], axis=1)  # (4,4)
@@ -133,6 +141,8 @@ def element_matrices_solid(nodes_elem: jnp.ndarray, E: float, nu: float, rho_s: 
     m = rho_s * V / 4.0
     M_e = m * jnp.eye(12)
     A_e = K_e - (omega**2)*M_e
+    if EXIT_FUNC_PRINT:
+        print(f"Exiting element_matrices_solid function...")
     return A_e
 
 # -------------------------
@@ -147,6 +157,8 @@ def assemble_global_system(nodes: jnp.ndarray, elements: jnp.ndarray, element_fu
     dof_per_node: 每节点自由度, 流体:1, 固体:3.
     返回全局矩阵 A (dense) 和右侧向量 f (本例中无体载荷 f=0)。
     """
+    if ENTER_FUNC_PRINT:
+        print(f"Entering assemble_global_system function...")
     n_nodes = nodes.shape[0]
     n_dof = n_nodes * dof_per_node
     A_global = jnp.zeros((n_dof, n_dof))
@@ -170,13 +182,15 @@ def assemble_global_system(nodes: jnp.ndarray, elements: jnp.ndarray, element_fu
         A_acc = A_acc.at[jnp.ix_(indices, indices)].add(A_e)
         return A_acc
     A_global = jax.lax.fori_loop(0, elements.shape[0], body_fun, A_global)
+    if EXIT_FUNC_PRINT:
+        print(f"Exiting assemble_global_system function...")
     return A_global, f_global
 
 # -------------------------
 # 6. 流固耦合矩阵组装（Penalty 方法）
 # -------------------------
 def assemble_coupling_system(nodes: jnp.ndarray, fluid_elements: jnp.ndarray, solid_elements: jnp.ndarray,
-                               omega: float, E: float, nu: float, rho_s: float) -> Tuple[jnp.ndarray, jnp.ndarray]:
+                               omega: float, E: float, nu: float, rho_s: float, interface_indices: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     组装流体与固体的耦合系统。  
     假定 fluid 元素每节点 1 d.o.f., solid 元素每节点 3 d.o.f., 且两者基于相同的节点集合（网格中所有节点均出现在两个物理域中）。
@@ -186,6 +200,8 @@ def assemble_coupling_system(nodes: jnp.ndarray, fluid_elements: jnp.ndarray, so
     对于每个界面节点（满足 |sqrt(y²+z²) - R_inner_main| < tol），在流体方程中加 α, 在固体方程中加入 -α * n_y, -α * n_z 等。
     全局自由度排序：先 fluid (n_nodes * 1), 后固体 (n_nodes * 3).
     """
+    if ENTER_FUNC_PRINT:
+        print(f"Entering assemble_coupling_system function...")
     nodes_fluid = nodes  # 所有节点
     nodes_solid = nodes  # 假设相同
     dof_fluid = nodes_fluid.shape[0]  # 1 d.o.f. 每节点
@@ -199,16 +215,7 @@ def assemble_coupling_system(nodes: jnp.ndarray, fluid_elements: jnp.ndarray, so
         [jnp.zeros((A_solid.shape[0], A_fluid.shape[1])), A_solid]
     ])
     f_global = jnp.concatenate([f_fluid, f_solid], axis=0)
-    # 边界耦合：确定流固界面节点
-    # IMPORTANT: this tolerance is used to determine the interface nodes.
-    tol = 1e-3
-    # 对于主管内表面，界面条件要求： |sqrt(y^2+z^2) - R_inner_main| < tol, 且 x in [x_main_min, x_main_max]
-    # nodes 已经是一个 jax 数组，形状 (n_nodes, 3)
-    def interface_mask(nodes):
-        r = jnp.sqrt(nodes[:,1]**2 + nodes[:,2]**2)
-        return jnp.abs(r - R_inner_main) < tol
-
-    interface_indices = jnp.nonzero(interface_mask(nodes))[0]
+    # 边界耦合：确定流固界面节点(interface_indices， 已经预处理)
     
     # 对每个界面节点，计算外侧法向量 n = (0, y/√(y²+z²), z/√(y²+z²))
     normals = []
@@ -221,9 +228,9 @@ def assemble_coupling_system(nodes: jnp.ndarray, fluid_elements: jnp.ndarray, so
     # 对每个界面节点, 在全局系统中对应 fluid dof index = i, solid dof indices = (i*3, i*3+1, i*3+2) but offset by dof_fluid.
     penalty = 1e8
     for idx, n_vec in zip(interface_indices, normals):
-        i_f = int(idx)  # fluid dof index (scalar)
+        i_f = idx  # fluid dof index (scalar)
         # solid: global index offset = dof_fluid + idx*3
-        i_s0 = int(idx)*3 + dof_fluid
+        i_s0 = idx*3 + dof_fluid
         # 组装对流固界面 penalty：
         # 式子： penalty*(p - (u·n))^2  对 p, u 施加耦合。求二阶导后加到全局矩阵中。
         A_global = A_global.at[i_f, i_f].add(penalty)
@@ -233,6 +240,8 @@ def assemble_coupling_system(nodes: jnp.ndarray, fluid_elements: jnp.ndarray, so
         A_global = A_global.at[i_s0+2, i_f].add(-penalty * n_vec[2])
         A_global = A_global.at[i_s0+1, i_s0+1].add(penalty * n_vec[1]**2)
         A_global = A_global.at[i_s0+2, i_s0+2].add(penalty * n_vec[2]**2)
+    if EXIT_FUNC_PRINT:
+        print(f"Exiting assemble_coupling_system function...")
     return A_global, f_global
 
 # -------------------------
@@ -241,11 +250,15 @@ def assemble_coupling_system(nodes: jnp.ndarray, fluid_elements: jnp.ndarray, so
 def solve_fsi_system(E: float, nu: float, rho_s: float, omega: float, mesh_data):
     """
     组装并求解流固耦合系统，返回全局解向量 u (dense)。
-    mesh_data: (nodes, elements_fluid, elements_solid)
+    mesh_data: (nodes, elements_fluid, elements_solid, interface_indices)
     """
-    nodes, elem_fluid, elem_solid = mesh_data
-    A_global, f_global = assemble_coupling_system(nodes, elem_fluid, elem_solid, omega, E, nu, rho_s)
+    if ENTER_FUNC_PRINT:
+        print(f"Entering solve_fsi_system function...")
+    nodes, elem_fluid, elem_solid, interface_indices = mesh_data
+    A_global, f_global = assemble_coupling_system(nodes, elem_fluid, elem_solid, omega, E, nu, rho_s, interface_indices)
     u = jnp.linalg.solve(A_global, f_global)
+    if EXIT_FUNC_PRINT:
+        print(f"Exiting solve_fsi_system function...")
     return u
 
 # -------------------------
@@ -253,15 +266,17 @@ def solve_fsi_system(E: float, nu: float, rho_s: float, omega: float, mesh_data)
 # -------------------------
 def interpolate_pressure(u: jnp.ndarray, nodes: jnp.ndarray, mic_pos: jnp.ndarray) -> jnp.ndarray:
     """
-    假定全局解向量 u 排列：前 n_nodes 为流体压力 (1 dof)。
-    采用最近邻插值，返回麦克风处的预测声压。
+    使用 JAX 实现最近邻插值，避免 NumPy 操作。
     """
+    if ENTER_FUNC_PRINT:
+        print(f"Entering interpolate_pressure function...")
     n_nodes = nodes.shape[0]
     p_fluid = u[:n_nodes]
-    nodes_np = np.array(nodes)
-    mic_np = np.array(mic_pos)
-    distances = np.linalg.norm(nodes_np - mic_np, axis=1)
-    idx = int(np.argmin(distances))
+    # 计算所有节点到麦克风位置的距离（使用 JAX 操作）
+    distances = jnp.linalg.norm(nodes - mic_pos, axis=1)
+    idx = jnp.argmin(distances)
+    if EXIT_FUNC_PRINT:
+        print(f"Exiting interpolate_pressure function...")
     return p_fluid[idx]
 
 # -------------------------
@@ -273,9 +288,13 @@ def forward_fsi(E: float, nu: float, rho_s: float, omega: float, mesh_data, mic_
     正向仿真接口：给定材料参数 (E, nu, rho_s) 及激励频率 omega，
     组装求解流固耦合系统，并返回远端麦克风处的预测声压 (标量)
     """
+    if ENTER_FUNC_PRINT:
+        print(f"Entering forward_fsi function...")
     u = solve_fsi_system(E, nu, rho_s, omega, mesh_data)
-    nodes, _, _ = mesh_data
+    nodes, _, _, _ = mesh_data
     p_mic = interpolate_pressure(u, nodes, mic_pos)
+    if EXIT_FUNC_PRINT:
+        print(f"Exiting forward_fsi function...")
     return p_mic
 
 

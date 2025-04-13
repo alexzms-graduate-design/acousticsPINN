@@ -10,8 +10,8 @@ from jax_fem import load_mesh, forward_fsi
 # 1. 基本参数与网格数据加载
 # -------------------------
 MESH_FILE = "y_pipe.msh"   # gmsh 生成的网格文件
-nodes, elem_fluid, elem_solid = load_mesh(MESH_FILE)
-mesh_data = (nodes, elem_fluid, elem_solid)
+nodes, elem_fluid, elem_solid, interface_indices = load_mesh(MESH_FILE)
+mesh_data = (nodes, elem_fluid, elem_solid, interface_indices)
 
 # 激励频率 (rad/s): 例如，对于 1000Hz, omega = 2π*1000
 freq = 1000.0
@@ -43,12 +43,17 @@ class JaxFEMMicPressure(torch.autograd.Function):
         def fem_obj(E_in, nu_in, rho_in):
             return forward_fsi(E_in, nu_in, rho_in, omega, mesh_data, mic_pos)
         # 求值和梯度（返回标量和对应梯度元组）
+        print("Entering jax.value_and_grad...")
         p_val, grads = jax.value_and_grad(fem_obj, argnums=(0,1,2))(float(E_np), float(nu_np), float(rho_np))
+        print(f"p_val: {p_val}, grads[0].shape: {grads[0].shape}, grads[1].shape: {grads[1].shape}, grads[2].shape: {grads[2].shape}")
+        print("Exiting jax.value_and_grad...")
         grad_E, grad_nu, grad_rho = grads
         # 保存梯度至 ctx（转换为 torch.tensor）
+        print("Entering ctx.save_for_backward...")
         ctx.save_for_backward(torch.tensor(grad_E, dtype=torch.float32),
                               torch.tensor(grad_nu, dtype=torch.float32),
                               torch.tensor(grad_rho, dtype=torch.float32))
+        print("Exiting ctx.save_for_backward...")
         return torch.tensor(np.array(p_pred), dtype=torch.float32)
 
     @staticmethod
@@ -90,6 +95,7 @@ for epoch in range(n_epochs):
     optimizer.zero_grad()
     # 调用自定义函数，得到 FEM 模型预测的远端声压
     pred_p = jax_fem_pressure(E_param, nu_param, rho_param)
+    print(f"pred_p: {pred_p}")
     # 定义 loss = (pred - meas)^2 （标量误差）
     loss = (pred_p - torch.tensor(meas_p, dtype=torch.float32))**2
     loss.backward()
@@ -97,7 +103,7 @@ for epoch in range(n_epochs):
     with torch.no_grad():
         nu_param.clamp_(0.0, 0.4999)
     optimizer.step()
-    if epoch % 5 == 0:
+    if epoch % 1 == 0:
         elapsed = time.time() - start_time
         print(f"Epoch {epoch:03d}, Loss={loss.item():.6e}, E={E_param.item():.3e}, nu={nu_param.item():.4f}, rho={rho_param.item():.2f}, Time={elapsed:.2f}s")
 print("优化完成！")

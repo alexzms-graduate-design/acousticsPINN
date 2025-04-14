@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import meshio
+from tqdm import tqdm
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -121,7 +122,7 @@ class CoupledFEMSolver(nn.Module):
         # 提取 tetrahedral单元并分物理组
         fluid_elems = []
         solid_elems = []
-        for cell in mesh.cells:
+        for cell in tqdm(mesh.cells, desc="[info] 提取单元"):
             if cell.type == "tetra":
                 data = cell.data
                 phys = mesh.cell_data_dict["gmsh:physical"]["tetra"]
@@ -187,7 +188,7 @@ class CoupledFEMSolver(nn.Module):
         n_nodes = self.nodes.shape[0]  # 全局节点数（假设 fluid 系统使用全部节点）
         A_f = torch.zeros((n_nodes, n_nodes), dtype=torch.float32, device=device)
         M_f = torch.zeros((n_nodes, n_nodes), dtype=torch.float32, device=device)
-        for elem in self.fluid_elements:
+        for elem in tqdm(self.fluid_elements, desc="[info] 流体域组装"):
             indices = elem  # 长度为 4
             coords = self.nodes[indices]  # [4,3]
             Ke, Me = element_matrices_fluid(coords)  # [4,4] each
@@ -202,7 +203,7 @@ class CoupledFEMSolver(nn.Module):
         F_f = torch.zeros((n_nodes, 1), dtype=torch.float32, device=device)
         # 对于近端边界 (噪音源) 采用 Dirichlet BC，设定 p = p0
         p0 = 1.0  # 假设噪音源输出 1.0 Pa
-        for idx in self.near_fluid_idx:
+        for idx in tqdm(self.near_fluid_idx, desc="[info] 流体域组装"):
             A_f[idx, :] = 0.0
             A_f[idx, idx] = 1.0
             F_f[idx] = p0
@@ -214,7 +215,7 @@ class CoupledFEMSolver(nn.Module):
         A_s = torch.zeros((n_solid * 3, n_solid * 3), dtype=torch.float32, device=device)
         M_s = torch.zeros((n_solid * 3, n_solid * 3), dtype=torch.float32, device=device)
         solid_mapping = {int(idx.item()): i for i, idx in enumerate(solid_node_ids)}
-        for elem in self.solid_elements:
+        for elem in tqdm(self.solid_elements, desc="[info] 固体域组装"):
             indices = elem
             coords = self.nodes[indices]
             Ke, Me = element_matrices_solid(coords, E, nu, rho_s)  # [12,12]
@@ -230,7 +231,7 @@ class CoupledFEMSolver(nn.Module):
         # ---- 耦合处理：对流固接口使用惩罚法 ----
         β = self.penalty
         # 对于每个固体接口节点，设对应 fluid 节点通过 self.interface_mapping 给出
-        for idx_idx, idx_solid in enumerate(self.interface_solid_idx):
+        for idx_idx, idx_solid in enumerate(tqdm(self.interface_solid_idx, desc="[info] 耦合处理")):
             # 对应 fluid 节点
             fluid_idx = self.interface_mapping[idx_idx].item()
             # 在流体系统，增加 β

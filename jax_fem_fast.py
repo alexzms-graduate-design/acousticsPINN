@@ -40,8 +40,8 @@ def load_mesh(msh_file: str):
     if any(v <= 0 for v in volumes):
         raise ValueError("存在无效单元体积（≤0），请调整网格参数！")
     
-    elements_fluid = np.array(mesh.cells[0].data, dtype=np.int32)
-    elements_solid = np.array(mesh.cells[1].data, dtype=np.int32)
+    elements_fluid = np.array(mesh.cells[1].data, dtype=np.int32)
+    elements_solid = np.array(mesh.cells[0].data, dtype=np.int32)
     
     # 预处理界面节点索引
     tol = 1e-3
@@ -75,7 +75,7 @@ def tetra_volume(nodes_elem: jnp.ndarray) -> jnp.ndarray:
     v2 = nodes_elem[2] - p0
     v3 = nodes_elem[3] - p0
     det_val = jnp.linalg.det(jnp.stack([v1, v2, v3], axis=1))
-    det_val = jnp.where(jnp.abs(det_val) < 1e-12, 1e-12, det_val)
+    # det_val = jnp.where(jnp.abs(det_val) < 1e-12, 1e-12, det_val)
     return jnp.abs(det_val) / 6.0
 
 # -------------------------
@@ -177,6 +177,15 @@ def assemble_global_system(nodes: jnp.ndarray, elements: jnp.ndarray, element_fu
     
     A_global, _ = jax.lax.scan(scatter, A_global, (elements, all_A_e))
     
+    # # print max value of A_global
+    # debug.callback(lambda x: print(f"Max value of A_global: {jnp.max(x)}"), A_global)
+    # debug.callback(lambda x: print(f"Min value of A_global: {jnp.min(x)}"), A_global)
+    # debug.callback(lambda x: print(f"Shape of A_global: {x.shape}"), A_global)
+    # # print max value of f_global
+    # debug.callback(lambda x: print(f"Max value of f_global: {jnp.max(x)}"), f_global)
+    # debug.callback(lambda x: print(f"Min value of f_global: {jnp.min(x)}"), f_global)
+    # debug.callback(lambda x: print(f"Shape of f_global: {x.shape}"), f_global)
+    
     # 添加声源激励（仅流体域）
     if source_indices is not None and dof_per_node == 1:
         dirichlet_penalty = 1e12
@@ -187,6 +196,14 @@ def assemble_global_system(nodes: jnp.ndarray, elements: jnp.ndarray, element_fu
             return A_f, f_f
         for idx in source_indices:
             A_global, f_global = apply_dirichlet(A_global, f_global, idx)
+    
+    # # 添加声源激励（仅流体域）
+    # if source_indices is not None and dof_per_node == 1:
+    #     f_global = f_global.at[source_indices].add(source_value)
+    
+    # print matrices
+    # debug.callback(lambda x: print(f"A_global: {x}"), A_global)
+    # debug.callback(lambda x: print(f"f_global: {x}"), f_global)
     return A_global, f_global
 
 # -------------------------
@@ -197,18 +214,24 @@ def assemble_coupling_system(nodes: jnp.ndarray, fluid_elements: jnp.ndarray, so
                              omega: float, E: float, nu: float, rho_s: float, 
                              interface_indices: jnp.ndarray, source_indices: jnp.ndarray = None, source_value: float = 0.0) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    向量化处理流固耦合惩罚项
+    向量化处理流固耦合惩罚项，并合并流体和固体的右侧向量
     """
-    # 组装基础矩阵
+    # 组装流体和固体的全局矩阵及右侧向量
     A_fluid, f_fluid = assemble_global_system(
         nodes, fluid_elements, element_matrices_fluid, omega, 
         dof_per_node=1, source_indices=source_indices, source_value=source_value
     )
-
-    A_solid, _ = assemble_global_system(nodes, solid_elements, element_matrices_solid, omega, E, nu, rho_s, dof_per_node=3)
-    A_global = jnp.block([[A_fluid, jnp.zeros((A_fluid.shape[0], A_solid.shape[1]))],
-                          [jnp.zeros((A_solid.shape[0], A_fluid.shape[1])), A_solid]])
+    A_solid, f_solid = assemble_global_system(
+        nodes, solid_elements, element_matrices_solid, omega, E, nu, rho_s, dof_per_node=3
+    )
     
+    # 合并全局矩阵和右侧向量
+    A_global = jnp.block([
+        [A_fluid, jnp.zeros((A_fluid.shape[0], A_solid.shape[1]))],
+        [jnp.zeros((A_solid.shape[0], A_fluid.shape[1])), A_solid]
+    ])
+    f_global = jnp.concatenate([f_fluid, f_solid], axis=0)  # 关键修正：合并右侧向量
+
     # 向量化法向量计算
     def compute_normal(i):
         coord = nodes[i]
@@ -216,8 +239,8 @@ def assemble_coupling_system(nodes: jnp.ndarray, fluid_elements: jnp.ndarray, so
         return jnp.array([0.0, coord[1]/r, coord[2]/r])
     normals = jax.vmap(compute_normal)(interface_indices)
     
-    # 向量化添加惩罚项
-    penalty = 1e8
+    # 向量化添加惩罚项（仅修改刚度矩阵，不修改右侧向量）
+    penalty = 1e8  # 或调整为更低值（如1e6）
     def add_penalty(A, idx_nvec):
         idx, n_vec = idx_nvec
         i_f = idx
@@ -234,9 +257,15 @@ def assemble_coupling_system(nodes: jnp.ndarray, fluid_elements: jnp.ndarray, so
         for row, col, val in updates:
             A = A.at[row, col].add(val)
         return A
-    return jax.lax.fori_loop(0, len(interface_indices), 
-                             lambda i, A: add_penalty(A, (interface_indices[i], normals[i])),
-                             A_global), jnp.zeros(A_global.shape[0])
+    
+    A_global_penalized = jax.lax.fori_loop(
+        0, len(interface_indices),
+        lambda i, A: add_penalty(A, (interface_indices[i], normals[i])),
+        A_global
+    )
+    
+    # 返回修正后的全局矩阵和合并后的右侧向量
+    return A_global_penalized, f_global
 
 # -------------------------
 # 7. 全局系统求解（保持原始接口）
@@ -245,7 +274,7 @@ def assemble_coupling_system(nodes: jnp.ndarray, fluid_elements: jnp.ndarray, so
 def solve_fsi_system(E: float, nu: float, rho_s: float, omega: float, mesh_data, source_indices: jnp.ndarray = None, source_value: float = 0.0):
     nodes, elem_fluid, elem_solid, interface_indices = mesh_data
     A_global, f_global = assemble_coupling_system(nodes, elem_fluid, elem_solid, omega, E, nu, rho_s, interface_indices, source_indices, source_value)
-    
+    debug.callback(lambda f: print(f"Max value of f_global: {jnp.max(jnp.abs(f))}"), f_global)
     # 添加正则化项防止奇异矩阵
     A_regularized = A_global + 1e-6 * jnp.eye(A_global.shape[0])
     u = jnp.linalg.solve(A_regularized, f_global)
@@ -258,9 +287,14 @@ def solve_fsi_system(E: float, nu: float, rho_s: float, omega: float, mesh_data,
 @jax.jit
 def interpolate_pressure(u: jnp.ndarray, nodes: jnp.ndarray, mic_pos: jnp.ndarray) -> jnp.ndarray:
     n_nodes = nodes.shape[0]
+    debug.callback(lambda x: print(f"n_nodes: {x}"), n_nodes)
     p_fluid = u[:n_nodes]
     distances = jnp.linalg.norm(nodes - mic_pos, axis=1)
-    return p_fluid[jnp.argmin(distances)]
+    
+    # Use softmax for differentiable "argmin"
+    temp = 100.0  # Temperature parameter - higher means closer to true argmin
+    weights = jax.nn.softmax(-temp * distances)
+    return jnp.sum(weights * p_fluid)
 
 # -------------------------
 # 9. 对外接口（JIT顶层封装）

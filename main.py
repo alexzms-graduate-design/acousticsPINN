@@ -48,20 +48,21 @@ class JaxFEMMicPressure(torch.autograd.Function):
         rho_np = rho_t.detach().cpu().numpy()
         # 调用 JAX FEM 正向函数 (已 JIT 编译)
         p_pred = forward_fsi(float(E_np), float(nu_np), float(rho_np), omega, mesh_data, mic_pos, source_indices, source_value)
+        print(f"p_pred: {p_pred}")
         # 获取梯度信息：使用 jax.value_and_grad
         def fem_obj(E_in, nu_in, rho_in):
             return forward_fsi(E_in, nu_in, rho_in, omega, mesh_data, mic_pos, source_indices, source_value)
         # 求值和梯度（返回标量和对应梯度元组）
         print("Entering jax.value_and_grad...")
         p_val, grads = jax.value_and_grad(fem_obj, argnums=(0,1,2))(float(E_np), float(nu_np), float(rho_np))
-        print(f"p_val: {p_val}, grads[0].shape: {grads[0].shape}, grads[1].shape: {grads[1].shape}, grads[2].shape: {grads[2].shape}")
+        print(f"p_val: {p_val}, grads[0]: {grads[0]}, grads[1]: {grads[1]}, grads[2]: {grads[2]}")
         print("Exiting jax.value_and_grad...")
         grad_E, grad_nu, grad_rho = grads
         # 保存梯度至 ctx（转换为 torch.tensor）
         print("Entering ctx.save_for_backward...")
-        ctx.save_for_backward(torch.tensor(grad_E, dtype=torch.float32),
-                              torch.tensor(grad_nu, dtype=torch.float32),
-                              torch.tensor(grad_rho, dtype=torch.float32))
+        ctx.save_for_backward(torch.tensor([float(grad_E)], dtype=torch.float32),
+                              torch.tensor([float(grad_nu)], dtype=torch.float32),
+                              torch.tensor([float(grad_rho)], dtype=torch.float32))
         print("Exiting ctx.save_for_backward...")
         return torch.tensor(np.array(p_pred), dtype=torch.float32)
 
@@ -69,10 +70,10 @@ class JaxFEMMicPressure(torch.autograd.Function):
     def backward(ctx, grad_output):
         grad_E, grad_nu, grad_rho = ctx.saved_tensors
         # grad_output 为标量，乘上 jax 计算的梯度
-        # 注意：所有梯度均为标量，直接返回相应结果
-        dE   = grad_output * grad_E
-        dnu  = grad_output * grad_nu
-        drho = grad_output * grad_rho
+        # 注意：梯度现在形状为[1]，需要提取元素值
+        dE   = grad_output * grad_E[0]
+        dnu  = grad_output * grad_nu[0]
+        drho = grad_output * grad_rho[0]
         return dE, dnu, drho
 
 def jax_fem_pressure(E, nu, rho):

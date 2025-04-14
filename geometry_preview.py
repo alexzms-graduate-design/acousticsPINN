@@ -44,15 +44,15 @@ def main():
     grids = convert_meshio_to_pv_by_physical(mesh)
     print(grids.keys())
     p = pv.Plotter()
-    # 按照预设：物理组 1 为管壁，物理组 2 为流体内腔
-    if 1 in grids:
-        p.add_mesh(grids[1], show_edges=True, color="lightgray", opacity=0.9, label="Pipe Wall")
-    else:
-        print("物理组 1（管壁）未找到")
+    # 按照预设：物理组 2 为管壁，物理组 1 为流体内腔
     if 2 in grids:
-        p.add_mesh(grids[2], show_edges=True, color="skyblue", opacity=0.65, label="Fluid Domain")
+        p.add_mesh(grids[2], show_edges=True, color="lightgray", opacity=0.9, label="Pipe Wall")
     else:
-        print("物理组 2（流体内腔）未找到")
+        print("物理组 2（管壁）未找到")
+    if 1 in grids:
+        p.add_mesh(grids[1], show_edges=True, color="skyblue", opacity=0.65, label="Fluid Domain")
+    else:
+        print("物理组 1（流体内腔）未找到")
     
     # 如有其它物理组，全部显示
     for tag, grid in grids.items():

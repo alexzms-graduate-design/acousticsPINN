@@ -58,12 +58,12 @@ def generate_y_pipe_mesh():
     # 定义物理组
     # 将管壁体定义为物理组 1，流体内腔（内并集）定义为物理组 2
     gmsh.model.occ.synchronize()
-    gmsh.model.addPhysicalGroup(3, [pipe_wall[0][1]], tag=1)  # 管壁体
-    gmsh.model.setPhysicalName(3, 1, "Pipe Wall")
+    gmsh.model.addPhysicalGroup(3, [pipe_wall[0][1]], tag=2)  # 管壁体
+    gmsh.model.setPhysicalName(3, 2, "Pipe Wall")
     gmsh.model.occ.synchronize()
     # 流体域
-    gmsh.model.addPhysicalGroup(3, [cylinder_fluid[0][1]], tag=2)
-    gmsh.model.setPhysicalName(3, 2, "Fluid Domain")
+    gmsh.model.addPhysicalGroup(3, [cylinder_fluid[0][1]], tag=1)
+    gmsh.model.setPhysicalName(3, 1, "Fluid Domain")
     
     gmsh.model.occ.synchronize()
     gmsh.model.mesh.generate(3)

@@ -6,6 +6,12 @@ import meshio
 from tqdm import tqdm
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# 管道参数定义
+r_outer = 0.05   # 外半径 5cm
+r_inner = 0.045  # 内半径 4.5cm
+angle = 45  # 分支角度
+length_main = 1.5  # 主干总长 1.5m
+
 
 # ===============================
 # 辅助函数：线性四面体元的计算
@@ -119,62 +125,284 @@ class CoupledFEMSolver(nn.Module):
         mesh = meshio.read(mesh_file)
         # 提取节点（3D 坐标）
         self.nodes = torch.tensor(mesh.points[:, :3], dtype=torch.float32, device=device)
-        # 提取 tetrahedral单元并分物理组
-        fluid_elems = []
-        solid_elems = []
-        for cell in tqdm(mesh.cells, desc="[info] 提取单元"):
-            if cell.type == "tetra":
-                data = cell.data
-                phys = mesh.cell_data_dict["gmsh:physical"]["tetra"]
-                for i in range(len(data)):
-                    if phys[i] == 1:  # Fluid 域
-                        fluid_elems.append(data[i])
-                    elif phys[i] == 2:  # Solid 域（管壁）
-                        solid_elems.append(data[i])
-        self.fluid_elements = torch.tensor(np.array(fluid_elems), dtype=torch.long, device=device)
-        self.solid_elements = torch.tensor(np.array(solid_elems), dtype=torch.long, device=device)
+        
+        # 检查是否存在四面体单元和物理标签
+        if 'tetra' not in mesh.cells_dict:
+            raise ValueError("Mesh does not contain tetrahedral elements ('tetra').")
+        if 'gmsh:physical' not in mesh.cell_data_dict or 'tetra' not in mesh.cell_data_dict['gmsh:physical']:
+            raise ValueError("Mesh does not contain physical tags for tetrahedra ('gmsh:physical'->'tetra').")
 
-        # 构建流固接口映射（假定流体内腔的边界即为内表面，且固体的外表面即为接口）
-        tol = 1e-3
-        r_inner = 0.045  # 内径 9cm/2 = 4.5cm
-        # 对于 fluid，找出节点满足： sqrt(y^2+z^2) ≈ 0.045
-        r_fluid = torch.norm(self.nodes[:,1:3], dim=1)
-        self.interface_fluid_idx = torch.nonzero(torch.abs(r_fluid - r_inner) < tol).squeeze()
-        # 对于 solid，亦然：固体接口节点为那些在固体单元中出现且满足条件
-        # 为简单起见，我们取 solid 单元中所有节点，再在这些节点中筛选：
-        solid_node_ids = torch.unique(self.solid_elements)
+        # 提取所有四面体单元及其物理标签
+        all_tetra_cells = mesh.cells_dict['tetra'] # shape (N_all_tetra, 4)
+        physical_tags = mesh.cell_data_dict['gmsh:physical']['tetra'] # shape (N_all_tetra,)
+        
+        # 根据物理标签区分流体（标签1）和固体（标签2）单元
+        fluid_mask = (physical_tags == 1)
+        solid_mask = (physical_tags == 2)
+        
+        fluid_elems_np = all_tetra_cells[fluid_mask]
+        solid_elems_np = all_tetra_cells[solid_mask]
+
+        if fluid_elems_np.size == 0:
+            print("[warning] No fluid elements found with physical tag 1.")
+        if solid_elems_np.size == 0:
+            print("[warning] No solid elements found with physical tag 2.")
+
+        self.fluid_elements = torch.tensor(fluid_elems_np, dtype=torch.long, device=device)
+        self.solid_elements = torch.tensor(solid_elems_np, dtype=torch.long, device=device)
+
+        print(f"[info] Loaded {self.fluid_elements.shape[0]} fluid elements (tag 1) and {self.solid_elements.shape[0]} solid elements (tag 2).")
+
+        # --- Interface Identification ---
+        fluid_node_ids = torch.unique(self.fluid_elements.flatten())
+        solid_node_ids = torch.unique(self.solid_elements.flatten())
+
+        # Get coordinates for potential interface nodes
+        fluid_coords = self.nodes[fluid_node_ids]
         solid_coords = self.nodes[solid_node_ids]
-        r_solid = torch.norm(solid_coords[:,1:3], dim=1)
-        interface_mask = torch.abs(r_solid - r_inner) < tol
-        self.interface_solid_idx = solid_node_ids[interface_mask]
-        # 建立从固体接口节点到流体接口节点的映射（最近邻搜索）
-        fluid_iface_coords = self.nodes[self.interface_fluid_idx]
-        mapping = []
-        for idx in self.interface_solid_idx:
-            coord = self.nodes[idx]
-            dists = torch.norm(fluid_iface_coords - coord, dim=1)
-            min_idx = torch.argmin(dists)
-            mapping.append(self.interface_fluid_idx[min_idx].item())
-        self.interface_mapping = torch.tensor(mapping, dtype=torch.long, device=device)
-        # 计算流体接口法向量：对于圆柱内壁，法向量约为 (0, y, z)/sqrt(y^2+z^2)
-        normals = []
-        for idx in self.interface_fluid_idx:
-            coord = self.nodes[idx]
-            yz = coord[1:3]
-            norm_val = torch.norm(yz)
-            if norm_val > 1e-6:
-                n = torch.cat([torch.tensor([0.0], device=device), yz/norm_val])
+
+        # Calculate pairwise distances (consider moving to CPU if GPU memory is an issue for large meshes)
+        print(f"[debug] Calculating distance matrix between {fluid_coords.shape[0]} fluid nodes and {solid_coords.shape[0]} solid nodes.")
+        dist_matrix = torch.cdist(fluid_coords, solid_coords)
+        print(f"[debug] Distance matrix calculation complete.")
+
+        # Define a small tolerance for proximity
+        proximity_tolerance = 1e-6 
+        
+        # Find pairs of nodes (indices into fluid_coords/solid_coords) that are close
+        close_pairs_indices = torch.nonzero(dist_matrix < proximity_tolerance)
+        
+        proximity_interface_idx = torch.tensor([], dtype=torch.long, device=device)
+        if close_pairs_indices.numel() == 0:
+            print(f"[warning] No fluid/solid node pairs found within tolerance {proximity_tolerance}. Proximity check yielded no interface nodes.")
+        else:
+            # Get the unique indices *from the original fluid_node_ids list* that correspond to close pairs
+            fluid_indices_in_close_pairs = close_pairs_indices[:, 0]
+            proximity_interface_idx = torch.unique(fluid_node_ids[fluid_indices_in_close_pairs])
+            print(f"[info] Found {proximity_interface_idx.shape[0]} interface nodes using geometric proximity (tolerance={proximity_tolerance}).")
+
+        # --- Additionally identify nodes on the main cylinder's inner surface (radius check) ---
+        r_inner = 0.045  # Main pipe inner radius
+        radius_tolerance = 1e-3 # Tolerance for radius check
+        
+        # Calculate radius in YZ plane for all nodes
+        r_all_nodes = torch.norm(self.nodes[:, 1:3], dim=1)
+        
+        # Find nodes potentially on the cylinder surface
+        potential_radius_nodes_idx = torch.nonzero(torch.abs(r_all_nodes - r_inner) < radius_tolerance).squeeze()
+        
+        # Ensure these nodes belong to the fluid domain
+        radius_nodes_mask = torch.isin(potential_radius_nodes_idx, fluid_node_ids)
+        radius_interface_idx = potential_radius_nodes_idx[radius_nodes_mask]
+        print(f"[info] Found {radius_interface_idx.shape[0]} potential interface nodes using radius check (r={r_inner}, tol={radius_tolerance}) that are in the fluid domain.")
+
+        # --- Combine results and remove duplicates ---
+        combined_interface_idx = torch.cat((proximity_interface_idx, radius_interface_idx))
+        self.interface_idx = torch.unique(combined_interface_idx)
+
+        print(f"[info] Final combined interface contains {self.interface_idx.shape[0]} unique nodes.")
+
+        # --- Accurate Normal Calculation using Face Normal Averaging ---
+        print("[info] Calculating interface normals using face normal averaging...")
+        interface_node_set = set(self.interface_idx.cpu().numpy())
+        node_to_face_normals = {node_id: [] for node_id in interface_node_set}
+
+        # Iterate through fluid elements to find interface faces and their normals
+        for elem_nodes in tqdm(self.fluid_elements, desc="Finding interface faces"):
+            nodes_coords = self.nodes[elem_nodes]  # Coords of the 4 nodes
+            # Define the 4 faces (local indices) - order matters for consistent initial normal guess
+            local_faces = [(0, 1, 2), (0, 3, 1), (0, 2, 3), (1, 3, 2)]
+
+            for i_face, local_face in enumerate(local_faces):
+                global_node_indices = elem_nodes[torch.tensor(local_face, device=elem_nodes.device)] # Global node indices for this face
+
+                # Check if all 3 nodes are interface nodes
+                is_interface_face = all(node_id.item() in interface_node_set for node_id in global_node_indices)
+
+                if is_interface_face:
+                    # Calculate face normal
+                    p0, p1, p2 = self.nodes[global_node_indices]
+                    v1 = p1 - p0
+                    v2 = p2 - p0
+                    normal = torch.cross(v1, v2)
+                    norm_mag = torch.norm(normal)
+
+                    if norm_mag > 1e-12: # Avoid division by zero for degenerate faces
+                        normal = normal / norm_mag
+
+                        # Orientation check: ensure normal points OUT of the fluid element
+                        # Find the 4th node (not part of this face)
+                        local_idx_p3 = list(set(range(4)) - set(local_face))[0]
+                        p3 = nodes_coords[local_idx_p3]
+                        face_centroid = (p0 + p1 + p2) / 3.0
+                        vec_to_p3 = p3 - face_centroid
+
+                        # If normal points towards p3 (inwards), flip it
+                        if torch.dot(normal, vec_to_p3) > 0:
+                            normal = -normal
+
+                        # Add this face normal to the lists of its 3 vertices
+                        for node_id_tensor in global_node_indices:
+                            node_id = node_id_tensor.item()
+                            if node_id in node_to_face_normals: # Should always be true
+                                node_to_face_normals[node_id].append(normal)
+                    # else: handle degenerate face? Skip for now.
+
+        # Calculate final vertex normals by averaging and normalizing
+        final_normals_list = []
+        zero_normal_count = 0
+        for node_id_tensor in tqdm(self.interface_idx, desc="Averaging vertex normals"):
+            node_id = node_id_tensor.item()
+            normals_to_average = node_to_face_normals.get(node_id, [])
+
+            if not normals_to_average:
+                # This might happen if a node is marked as interface but isn't part of any *fluid* interface face
+                avg_normal = torch.zeros(3, device=device)
+                zero_normal_count += 1
             else:
-                n = torch.zeros(3, device=device)
-            normals.append(n)
-        self.interface_normals = torch.stack(normals, dim=0)  # shape [n_iface,3]
+                avg_normal = torch.sum(torch.stack(normals_to_average), dim=0)
+                norm_val = torch.norm(avg_normal)
+                if norm_val < 1e-12:
+                    avg_normal = torch.zeros(3, device=device) # Avoid division by zero
+                    zero_normal_count += 1
+                else:
+                    avg_normal = avg_normal / norm_val
+            final_normals_list.append(avg_normal)
+
+        if zero_normal_count > 0:
+            print(f"[warning] {zero_normal_count} interface nodes ended up with a zero normal vector.")
+            
+        self.interface_normals = torch.stack(final_normals_list, dim=0)
+        print("[info] Interface normal calculation complete.")
+        # --- End Normal Calculation ---
+
         # 定义噪音源边界：fluid 节点中 x ≈ 0
-        tol_near = 1e-3
-        self.near_fluid_idx = torch.nonzero(torch.abs(self.nodes[:,0]) < tol_near).squeeze()
+        # 需要确保这些节点确实在流体域中
+        potential_near_indices = torch.nonzero(torch.abs(self.nodes[:,0]) < 1e-3).squeeze()
+        # 检查这些潜在入口节点是否在 fluid_node_ids 中
+        near_mask = torch.isin(potential_near_indices, fluid_node_ids)
+        self.near_fluid_idx = potential_near_indices[near_mask]
+        
         # 定义远端评估点：fluid 节点中 x ≈ 1.0 （远端麦克风放置位置）
-        tol_far = 1e-3
-        self.far_fluid_idx = torch.nonzero(torch.abs(self.nodes[:,0] - 1.0) < tol_far).squeeze()
-        print("[info] 初始化完成")
+        potential_far_indices = torch.nonzero(torch.abs(self.nodes[:,0] - 1.0) < 1e-3).squeeze()
+        # 检查这些潜在远端节点是否在 fluid_node_ids 中
+        far_mask = torch.isin(potential_far_indices, fluid_node_ids)
+        self.far_fluid_idx = potential_far_indices[far_mask]
+        
+        # 找到距离 (1.0, 0, 0) 最近的流体节点作为精确的麦克风位置
+        mic_target_pos = torch.tensor([1.0, 0.0, 0.0], device=device)
+        far_nodes_coords = self.nodes[self.far_fluid_idx]
+        dists_to_mic = torch.norm(far_nodes_coords - mic_target_pos, dim=1)
+        self.mic_node_idx = self.far_fluid_idx[torch.argmin(dists_to_mic)] # 单个节点索引
+        print(f"  Mic node index: {self.mic_node_idx}, Coord: {self.nodes[self.mic_node_idx]}")
+
+        # 定义出口边界：fluid 节点中 x ≈ 1.5
+        outlet_tolerance = 1e-3
+        potential_outlet_indices = torch.nonzero(torch.abs(self.nodes[:,0] - 1.5) < outlet_tolerance).squeeze()
+        # 检查这些潜在出口节点是否在 fluid_node_ids 中
+        outlet_mask = torch.isin(potential_outlet_indices, fluid_node_ids)
+        self.outlet_fluid_idx = potential_outlet_indices[outlet_mask]
+        
+        print(f"[info] 初始化完成, fluid elems: {self.fluid_elements.shape[0]}, solid elems: {self.solid_elements.shape[0]}, interface nodes: {self.interface_idx.shape[0]}, inlet nodes: {self.near_fluid_idx.shape[0]}, far nodes: {self.far_fluid_idx.shape[0]}, outlet nodes: {self.outlet_fluid_idx.shape[0]}")
+        self.visualize_elements()
+        input("[info] 按回车继续...")
+
+    
+    # 在 CoupledFEMSolver.__init__ 的末尾处新增可视化方法
+    def visualize_elements(self):
+        import pyvista as pv
+        import numpy as np
+
+        # 将节点转换为 CPU 的 numpy 数组
+        nodes_np = self.nodes.detach().cpu().numpy()  # [n_nodes, 3]
+
+        # -----------------------------
+        # 可视化 Fluid Elements（四面体单元的三角面）
+        # -----------------------------
+        fluid_cells = self.fluid_elements.detach().cpu().numpy()  # 每个单元4个节点
+        fluid_faces = []
+        for cell in fluid_cells:
+            pts = cell.tolist()
+            # 四面体的4个三角面: (0,1,2), (0,1,3), (0,2,3), (1,2,3)
+            faces = [
+                pts[0:3],
+                [pts[0], pts[1], pts[3]],
+                [pts[0], pts[2], pts[3]],
+                [pts[1], pts[2], pts[3]]
+            ]
+            fluid_faces.extend(faces)
+        # 构造一维数组：[3, id0, id1, id2, 3, id0, id1, id2, ...]
+        fluid_faces_flat = []
+        for face in fluid_faces:
+            fluid_faces_flat.append(3)
+            fluid_faces_flat.extend(face)
+        fluid_faces_flat = np.array(fluid_faces_flat, dtype=np.int64)
+
+        fluid_mesh = pv.PolyData(nodes_np, fluid_faces_flat)
+
+        # -----------------------------
+        # 可视化 Solid Elements（四面体单元的三角面）
+        # -----------------------------
+        solid_cells = self.solid_elements.detach().cpu().numpy()  # 每个单元4个节点
+        solid_faces = []
+        for cell in solid_cells:
+            pts = cell.tolist()
+            faces = [
+                pts[0:3],
+                [pts[0], pts[1], pts[3]],
+                [pts[0], pts[2], pts[3]],
+                [pts[1], pts[2], pts[3]]
+            ]
+            solid_faces.extend(faces)
+        solid_faces_flat = []
+        for face in solid_faces:
+            solid_faces_flat.append(3)
+            solid_faces_flat.extend(face)
+        solid_faces_flat = np.array(solid_faces_flat, dtype=np.int64)
+
+        solid_mesh = pv.PolyData(nodes_np, solid_faces_flat)
+
+        # -----------------------------
+        # 可视化 Interface
+        # -----------------------------
+        interface_nodes = self.nodes[self.interface_idx].detach().cpu().numpy()
+        interface_normals = self.interface_normals.detach().cpu().numpy()  # [n_iface, 3]
+
+        # 构造 PyVista 点云
+        interface_points = pv.PolyData(interface_nodes)
+
+        # -----------------------------
+        # 可视化 Inlet Nodes
+        # -----------------------------
+        inlet_nodes = self.nodes[self.near_fluid_idx].detach().cpu().numpy()
+        inlet_points = pv.PolyData(inlet_nodes)
+
+        # -----------------------------
+        # 可视化 Outlet Nodes
+        # -----------------------------
+        outlet_nodes = self.nodes[self.outlet_fluid_idx].detach().cpu().numpy()
+        outlet_points = pv.PolyData(outlet_nodes)
+
+        # 生成箭头：利用每个 interface 点及其法向量，设定箭头长度
+        arrows = []
+        arrow_length = 0.01  # 可根据需要调整
+        for pt, n in zip(interface_nodes, interface_normals):
+            arrow = pv.Arrow(start=pt, direction=n, scale=arrow_length)
+            arrows.append(arrow)
+        arrows = arrows[0].merge(arrows[1:]) if len(arrows) > 1 else arrows[0]
+
+        # -----------------------------
+        # 绘图
+        # -----------------------------
+        plotter = pv.Plotter()
+        plotter.add_mesh(fluid_mesh, color="cyan", opacity=0.5, label="Fluid Elements")
+        plotter.add_mesh(solid_mesh, color="magenta", opacity=0.5, label="Solid Elements")
+        plotter.add_mesh(interface_points, color="blue", point_size=10, render_points_as_spheres=True, label="Interface Nodes")
+        plotter.add_mesh(inlet_points, color="yellow", point_size=10, render_points_as_spheres=True, label="Inlet Nodes")
+        plotter.add_mesh(outlet_points, color="grey", point_size=10, render_points_as_spheres=True, label="Outlet Nodes")
+        plotter.add_mesh(arrows, color="green", label="Interface Normals")
+        plotter.add_legend()
+        plotter.show()
     
     def assemble_global_system(self, E, nu, rho_s):
         """
@@ -231,9 +459,9 @@ class CoupledFEMSolver(nn.Module):
         # ---- 耦合处理：对流固接口使用惩罚法 ----
         β = self.penalty
         # 对于每个固体接口节点，设对应 fluid 节点通过 self.interface_mapping 给出
-        for idx_idx, idx_solid in enumerate(tqdm(self.interface_solid_idx, desc="[info] 耦合处理")):
+        for idx_idx, idx_solid in enumerate(tqdm(self.interface_idx, desc="[info] 耦合处理")):
             # 对应 fluid 节点
-            fluid_idx = self.interface_mapping[idx_idx].item()
+            fluid_idx = idx_solid.item()
             # 在流体系统，增加 β
             A_f[fluid_idx, fluid_idx] += β
             F_f[fluid_idx] += 0.0  # 期望条件： p + n^T σ(u) = 0

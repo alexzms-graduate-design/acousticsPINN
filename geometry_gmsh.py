@@ -17,6 +17,7 @@ def generate_y_pipe_mesh():
     # 参数定义
     r_outer = 0.05   # 外半径 5cm
     r_inner = 0.045  # 内半径 4.5cm
+    angle = 45  # 分支角度
     length_main = 1.5  # 主干总长 1.5m
 
     # -------------------------------
@@ -26,8 +27,8 @@ def generate_y_pipe_mesh():
     cylinder_main_outer = gmsh.model.occ.addCylinder(0, 0, 0, length_main, 0, 0, r_outer)
     # 分支外管：在 x=0.5 处，以45度角向后延伸0.3m
     L_branch = 0.3
-    dx = L_branch * math.cos(math.radians(45))
-    dy = L_branch * math.sin(math.radians(45))
+    dx = L_branch * math.cos(math.radians(angle))
+    dy = L_branch * math.sin(math.radians(angle))
     cylinder_branch_outer = gmsh.model.occ.addCylinder(0.5, 0, 0, -dx, dy, 0, r_outer)
     
     gmsh.model.occ.synchronize()
@@ -58,13 +59,14 @@ def generate_y_pipe_mesh():
     # 定义物理组
     # 将流体内腔定义为物理组 1, 管壁体定义为物理组 2
     # 流体域
+    gmsh.model.occ.synchronize()
     gmsh.model.addPhysicalGroup(3, [cylinder_fluid[0][1]], tag=1)
     gmsh.model.setPhysicalName(3, 1, "Fluid Domain")
-    gmsh.model.occ.synchronize()
+    
     # 管壁体
+    gmsh.model.occ.synchronize()
     gmsh.model.addPhysicalGroup(3, [pipe_wall[0][1]], tag=2)  # 管壁体
     gmsh.model.setPhysicalName(3, 2, "Pipe Wall")
-    gmsh.model.occ.synchronize()
 
     
     gmsh.model.occ.synchronize()
@@ -84,5 +86,8 @@ if __name__ == "__main__":
     print(f"cell_data_dict['gmsh:physical']['tetra'].shape: {mesh.cell_data_dict['gmsh:physical']['tetra'].shape}")
     print(f"tetra shape(cells[0].data): {mesh.cells[0].data.shape}")
     print(f"tetra shape(cells[1].data): {mesh.cells[1].data.shape}")
-    print(f"# of physics group=1: {len(mesh.cell_data_dict['gmsh:physical']['tetra'][mesh.cell_data_dict['gmsh:physical']['tetra'] == 1])}")
-    print(f"# of physics group=2: {len(mesh.cell_data_dict['gmsh:physical']['tetra'][mesh.cell_data_dict['gmsh:physical']['tetra'] == 2])}")
+    print(f"# of physics group=1(fluid): {len(mesh.cell_data_dict['gmsh:physical']['tetra'][mesh.cell_data_dict['gmsh:physical']['tetra'] == 1])}")
+    print(f"# of physics group=2(solid): {len(mesh.cell_data_dict['gmsh:physical']['tetra'][mesh.cell_data_dict['gmsh:physical']['tetra'] == 2])}")
+    print(f"# of total nodes: {mesh.points.shape[0]}")
+    print(f"# of fluid nodes: {len(mesh.cell_data_dict['gmsh:physical']['tetra'][mesh.cell_data_dict['gmsh:physical']['tetra'] == 1])}")
+    print(f"# of solid nodes: {len(mesh.cell_data_dict['gmsh:physical']['tetra'][mesh.cell_data_dict['gmsh:physical']['tetra'] == 2])}")

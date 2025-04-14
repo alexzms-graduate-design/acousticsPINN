@@ -119,8 +119,7 @@ for epoch in range(n_epochs):
     pred_p = jax_fem_pressure(E_norm_param, nu_param, rho_norm_param)
     print(f"pred_p: {pred_p}")
     # 定义 loss = (pred - meas)^2 （标量误差）
-    loss = (pred_p - torch.tensor(meas_p, dtype=torch.float32))**2 + \
-            1e-5 * (E_norm_param-0.5)**2 + 1e-5 * (rho_norm_param-0.4)**2
+    loss = (pred_p - torch.tensor(meas_p, dtype=torch.float32))**2
     loss.backward()
     # 保证参数范围
     with torch.no_grad():

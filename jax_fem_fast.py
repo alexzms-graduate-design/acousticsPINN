@@ -335,7 +335,7 @@ def assemble_coupling_system_normalized(nodes: jnp.ndarray, fluid_elements: jnp.
     normals = jax.vmap(compute_normal)(interface_indices)
     
     # 向量化添加惩罚项（仅修改刚度矩阵，不修改右侧向量）
-    penalty = 1e8  # 或调整为更低值（如1e6）
+    penalty = 1e6  # 或调整为更低值（如1e6）
     def add_penalty(A, idx_nvec):
         idx, n_vec = idx_nvec
         i_f = idx

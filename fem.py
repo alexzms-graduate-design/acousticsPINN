@@ -360,6 +360,23 @@ class CoupledFEMSolver(nn.Module):
              print("[warning] No suitable far fluid nodes found for microphone placement.")
              self.mic_node_idx = None # Handle this downstream
 
+        # --- Identify Solid Nodes for Fixed BCs ---
+        solid_node_ids_all = torch.unique(self.solid_elements.flatten())
+        solid_coords_all = self.nodes[solid_node_ids_all]
+        solid_r_yz = torch.linalg.norm(solid_coords_all[:, 1:3], dim=1)
+        
+        outer_radius_tol = 1e-3
+        end_plane_tol = 1e-3
+        
+        # Find solid nodes near x=0 and near r=r_outer
+        fixed_solid_mask = (torch.abs(solid_coords_all[:, 0]) < end_plane_tol) & \
+                           (torch.abs(solid_r_yz - r_outer) < outer_radius_tol)
+                           
+        self.fixed_solid_nodes_idx = solid_node_ids_all[fixed_solid_mask]
+        print(f"[info] Identified {self.fixed_solid_nodes_idx.shape[0]} solid nodes at x=0 outer surface to fix.")
+        if self.fixed_solid_nodes_idx.shape[0] < 3: # Need at least 3 non-collinear points generally
+             print("[warning] Fewer than 3 solid nodes found to fix. Rigid body modes might not be fully constrained.")
+
         print(f"[info] 初始化完成, fluid elems: {self.fluid_elements.shape[0]}, solid elems: {self.solid_elements.shape[0]}, interface nodes: {self.interface_idx.shape[0]}, inlet nodes: {self.near_fluid_idx.shape[0]}, combined outlet nodes: {self.outlet_fluid_idx.shape[0]}")
         self.visualize_elements()
         input("[info] 按回车继续...")
@@ -546,21 +563,50 @@ class CoupledFEMSolver(nn.Module):
         # 在完整工业级耦合中，流体和固体之间应通过耦合矩阵构成 off-diagonals，
         # 但这里采用了惩罚法将耦合作用隐含在对角线上。
         print("[info] 矩阵组装完成")
+
+        # ------ Apply Solid Fixed Boundary Conditions ------
+        # Fix displacement (u_x=u_y=u_z=0) for nodes in self.fixed_solid_nodes_idx
+        # Penalty method for applying Dirichlet BCs u=0
+        dirichlet_penalty_solid = 1e10 # Use a large penalty value
+        
+        for node_idx in tqdm(self.fixed_solid_nodes_idx, desc="Applying fixed solid BCs"):
+            # Map node index to solid DOF indices (remembering the n_nodes offset)
+            # Solid node `node_idx` corresponds to DOFs: n_nodes + node_idx*3 + 0 (ux)
+            #                                              n_nodes + node_idx*3 + 1 (uy)
+            #                                              n_nodes + node_idx*3 + 2 (uz)
+            dof_indices = [n_nodes + node_idx * 3 + i for i in range(3)]
+            
+            for dof_idx in dof_indices:
+                 if dof_idx < A_global.shape[0]: # Boundary check
+                      A_global[dof_idx, :] = 0.0 # Zero out the row
+                      A_global[:, dof_idx] = 0.0 # Zero out the column (for symmetry, though solve doesn't strictly need it)
+                      A_global[dof_idx, dof_idx] = dirichlet_penalty_solid # Set diagonal to penalty
+                      F_global[dof_idx] = 0.0 # Set RHS to penalty * desired_value (0)
+                 else:
+                      print(f"[warning] Calculated solid DOF index {dof_idx} out of bounds for A_global shape {A_global.shape[0]}.")
+
         return A_global, F_global, n_nodes, n_solid
 
     def solve(self, E, nu, rho_s):
         """
         给定材料参数，组装全局系统并求解，返回：
           - 预测远端麦克风处流体声压（取 fluid 域 x≈1.0 点平均）
-          - 全局解向量 u（其中 u[0:n_fluid] 为 fluid 声压）
+          - 全局解向量 u（其中 u[0:n_nodes] 为 fluid 声压）
         """
-        A_global, F_global, n_fluid, n_solid = self.assemble_global_system(E, nu, rho_s)
+        A_global, F_global, n_nodes, n_solid_unique = self.assemble_global_system(E, nu, rho_s)
         print("[info] 开始求解")
         u = torch.linalg.solve(A_global, F_global)
         print("[info] 求解完成")
         # 从 fluid 部分取出远端麦克风处预测
-        if self.far_fluid_idx.numel() > 0:
-            p_far = torch.mean(u[self.far_fluid_idx])
+        if self.mic_node_idx is not None:
+             # Ensure mic_node_idx is within the fluid range
+             if self.mic_node_idx < n_nodes:
+                  p_mic = u[self.mic_node_idx]
+             else:
+                  print(f"[warning] Mic node index {self.mic_node_idx} is out of bounds for fluid DOFs ({n_nodes}). Setting p_mic to 0.")
+                  p_mic = torch.tensor(0.0, device=device)
         else:
-            p_far = torch.tensor(0.0, device=device)
-        return p_far, u
+             print("[warning] Mic node index not found. Setting p_mic to 0.")
+             p_mic = torch.tensor(0.0, device=device)
+             
+        return p_mic, u

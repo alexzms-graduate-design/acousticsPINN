@@ -377,7 +377,7 @@ class CoupledFEMSolver(nn.Module):
         if self.fixed_solid_nodes_idx.shape[0] < 3: # Need at least 3 non-collinear points generally
              print("[warning] Fewer than 3 solid nodes found to fix. Rigid body modes might not be fully constrained.")
 
-        print(f"[info] 初始化完成, fluid elems: {self.fluid_elements.shape[0]}, solid elems: {self.solid_elements.shape[0]}, interface nodes: {self.interface_idx.shape[0]}, inlet nodes: {self.near_fluid_idx.shape[0]}, combined outlet nodes: {self.outlet_fluid_idx.shape[0]}")
+        print(f"[info] 初始化完成, fluid elems: {self.fluid_elements.shape[0]}, solid elems: {self.solid_elements.shape[0]}, interface nodes: {self.interface_idx.shape[0]}, inlet nodes: {self.near_fluid_idx.shape[0]}, combined outlet nodes: {self.outlet_fluid_idx.shape[0]}, fixed solid nodes: {self.fixed_solid_nodes_idx.shape[0]}")
         self.visualize_elements()
         input("[info] 按回车继续...")
 
@@ -457,6 +457,12 @@ class CoupledFEMSolver(nn.Module):
         # -----------------------------
         outlet_nodes = self.nodes[self.outlet_fluid_idx].detach().cpu().numpy()
         outlet_points = pv.PolyData(outlet_nodes)
+        
+        # -----------------------------
+        # 可视化 Fixed Solid Nodes
+        # -----------------------------
+        fixed_solid_nodes = self.nodes[self.fixed_solid_nodes_idx].detach().cpu().numpy()
+        fixed_solid_points = pv.PolyData(fixed_solid_nodes)
 
         # 生成箭头：利用每个 interface 点及其法向量，设定箭头长度
         arrows = []
@@ -475,6 +481,7 @@ class CoupledFEMSolver(nn.Module):
         plotter.add_mesh(interface_points, color="blue", point_size=10, render_points_as_spheres=True, label="Interface Nodes")
         plotter.add_mesh(inlet_points, color="yellow", point_size=10, render_points_as_spheres=True, label="Inlet Nodes")
         plotter.add_mesh(outlet_points, color="grey", point_size=10, render_points_as_spheres=True, label="Outlet Nodes")
+        plotter.add_mesh(fixed_solid_points, color="purple", point_size=10, render_points_as_spheres=True, label="Fixed Solid Nodes")
         plotter.add_mesh(arrows, color="green", label="Interface Normals")
         plotter.add_legend()
         plotter.show()
@@ -548,7 +555,7 @@ class CoupledFEMSolver(nn.Module):
             # 对固体系统，找到该节点在固体域中的序号
             if int(idx_solid.item()) in solid_mapping:
                 i_struct = solid_mapping[int(idx_solid.item())]
-                n_vec = self.interface_normals[0]  # 此处取第一个接口法向量（工业级代码应逐点使用对应法向量）
+                n_vec = self.interface_normals[idx_idx]
                 penalty_mat = β * torch.ger(n_vec, n_vec)  # 3x3
                 A_s[i_struct*3:(i_struct+1)*3, i_struct*3:(i_struct+1)*3] += penalty_mat
         print("[info] 耦合处理完成")
@@ -562,14 +569,12 @@ class CoupledFEMSolver(nn.Module):
         # 此处未组装流固耦合的 off-diagonal项，
         # 在完整工业级耦合中，流体和固体之间应通过耦合矩阵构成 off-diagonals，
         # 但这里采用了惩罚法将耦合作用隐含在对角线上。
-        print("[info] 矩阵组装完成")
-
         # ------ Apply Solid Fixed Boundary Conditions ------
         # Fix displacement (u_x=u_y=u_z=0) for nodes in self.fixed_solid_nodes_idx
         # Penalty method for applying Dirichlet BCs u=0
         dirichlet_penalty_solid = 1e10 # Use a large penalty value
         
-        for node_idx in tqdm(self.fixed_solid_nodes_idx, desc="Applying fixed solid BCs"):
+        for node_idx in tqdm(self.fixed_solid_nodes_idx, desc="[info] 固定边界条件组装"):
             # Map node index to solid DOF indices (remembering the n_nodes offset)
             # Solid node `node_idx` corresponds to DOFs: n_nodes + node_idx*3 + 0 (ux)
             #                                              n_nodes + node_idx*3 + 1 (uy)
@@ -584,7 +589,7 @@ class CoupledFEMSolver(nn.Module):
                       F_global[dof_idx] = 0.0 # Set RHS to penalty * desired_value (0)
                  else:
                       print(f"[warning] Calculated solid DOF index {dof_idx} out of bounds for A_global shape {A_global.shape[0]}.")
-
+        print("[info] 矩阵组装完成")
         return A_global, F_global, n_nodes, n_solid
 
     def solve(self, E, nu, rho_s):

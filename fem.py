@@ -784,10 +784,10 @@ class CoupledFEMSolver(nn.Module):
         visualize_system(A_global, F_global, N_fluid_unique, n_solid_dof, title_suffix="Raw Assembly Mapped")
 
         # ---- Apply ALL Dirichlet Boundary Conditions to Mapped A_global, F_global ----
-        print("[info] Applying ALL boundary conditions (mapped)...")
+        print("[info] Applying boundary conditions (mapped)...")
         penalty = self.bcpenalty
 
-        # Apply Fluid Inlet BC (p = source_value)
+        # Apply Fluid Inlet BC (p = source_value) - Dirichlet condition
         print(f"[debug] Applying fluid inlet BC (p={source_value}) to {self.near_fluid_idx.shape[0]} global nodes...")
         nodes_processed_by_inlet = set()
         for global_idx_tensor in self.near_fluid_idx:
@@ -803,22 +803,22 @@ class CoupledFEMSolver(nn.Module):
              else:
                  print(f"[warning] Inlet node {global_idx} not found in fluid_mapping.")
 
-        # Apply Fluid Outlet BC (p = 0)
-        print(f"[debug] Applying fluid outlet BC (p=0) to {self.outlet_fluid_idx.shape[0]} global nodes...")
+        # Apply Fluid Outlet BC (dp/dn = 0) - Neumann condition (non-reflecting)
+        # For Neumann boundary condition, we don't need to modify the system matrix
+        # The natural boundary condition dp/dn = 0 is automatically satisfied
+        # Just need to report that we're using this type of boundary
+        print(f"[info] Using Neumann boundary condition (dp/dn=0) at outlets ({self.outlet_fluid_idx.shape[0]} nodes)")
+        print(f"[info] This is a non-reflecting outlet boundary condition")
+        
+        # Verify that outlet nodes are in the fluid domain
+        valid_outlet_count = 0
         for global_idx_tensor in self.outlet_fluid_idx:
-             global_idx = global_idx_tensor.item()
-             if global_idx in fluid_mapping: # Ensure it's a fluid node
-                 local_idx = fluid_mapping[global_idx]
-                 if local_idx in nodes_processed_by_inlet:
-                      print(f"[warning] Node {global_idx} (local {local_idx}) is both inlet and outlet? Skipping outlet BC.")
-                      continue
-                 A_global[local_idx, :] = 0.0
-                 A_global[:, local_idx] = 0.0
-                 A_global[local_idx, local_idx] = penalty
-                 F_global[local_idx] = 0.0 # Penalty * 0
-             else:
-                  print(f"[warning] Outlet node {global_idx} not found in fluid_mapping.")
-
+            global_idx = global_idx_tensor.item()
+            if global_idx in fluid_mapping:
+                valid_outlet_count += 1
+            else:
+                print(f"[warning] Outlet node {global_idx} not found in fluid_mapping.")
+        print(f"[info] Found {valid_outlet_count} valid outlet nodes for Neumann boundary condition")
 
         # Apply Solid Fixed BCs (u = 0)
         print(f"[debug] Applying fixed solid BCs to {self.fixed_solid_nodes_idx.shape[0]} global nodes...")
@@ -859,7 +859,7 @@ class CoupledFEMSolver(nn.Module):
         A_global, F_global, N_fluid_unique, n_solid_dof_actual = self.assemble_global_system(E, nu, rho_s)
         print("[info] 开始求解 (mapped system)")
         try:
-            u = torch.linalg.solve(A_global.float(), F_global.float())
+            u = torch.linalg.lstsq(A_global, F_global).solution
         except torch._C._LinAlgError as e:
             print(f"Solver Error: {e}")
             print("Matrix might still be singular or ill-conditioned.")

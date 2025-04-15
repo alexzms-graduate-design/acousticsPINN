@@ -867,7 +867,7 @@ class CoupledFEMSolver(nn.Module):
             torch.save(F_global, 'F_global_error.pt')
             raise
         print("[info] 求解完成")
-
+        print(f"[info] topk: {torch.topk(u, 100)}")
         # Extract microphone pressure using fluid_mapping
         p_mic = torch.tensor(0.0, device=device, dtype=u.dtype) # Default value
         if self.mic_node_idx is not None:
@@ -882,7 +882,8 @@ class CoupledFEMSolver(nn.Module):
                   print(f"[warning] Global mic node index {global_mic_idx} not found in fluid_mapping.")
         else:
              print("[warning] Mic node index not defined.")
-
+        print(f"[info] 预测远端麦克风处流体声压: {p_mic.squeeze()}")
+        exit(1)
         return p_mic.squeeze(), u # Return scalar p_mic
 
     def assemble_global_fluid_system(self):

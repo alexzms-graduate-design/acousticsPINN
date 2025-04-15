@@ -560,8 +560,8 @@ class CoupledFEMSolver(nn.Module):
              print("[warning] 固定的固体节点少于3个。刚体模式可能未完全约束.")
 
         print(f"[info] 初始化完成, fluid elems: {self.fluid_elements.shape[0]}, solid elems: {self.solid_elements.shape[0]}, interface nodes: {self.interface_idx.shape[0]}, inlet nodes: {self.near_fluid_idx.shape[0]}, combined outlet nodes: {self.outlet_fluid_idx.shape[0]}, fixed solid nodes: {self.fixed_solid_nodes_idx.shape[0]}")
-        self.visualize_elements()
-        input("[info] 按回车继续...")
+        # self.visualize_elements()
+        # input("[info] 按回车继续...")
 
     
     # 在 CoupledFEMSolver.__init__ 的末尾处新增可视化方法
@@ -661,8 +661,14 @@ class CoupledFEMSolver(nn.Module):
         plotter.add_legend()
         plotter.show()
     
-    def assemble_global_system(self, E, nu, rho_s, source_value=1.0):
-        """ Assemble coupled system using mappings and apply ALL BCs """
+    def assemble_global_system(self, E, nu, rho_s, inlet_source=1.0, volume_source=None):
+        """ Assemble coupled system using mappings and apply ALL BCs 
+        
+        Args:
+            E, nu, rho_s: 固体材料参数
+            source_value: 入口边界处声压值
+            volume_source: 体激励项，可以是常数或函数f(x,y,z)
+        """
         # Get sizes and mappings from self
         N_fluid_unique = self.N_fluid_unique
         n_solid_dof = self.n_solid_dof
@@ -671,7 +677,7 @@ class CoupledFEMSolver(nn.Module):
 
         # ---- Raw System Assembly ----
         print("[info] Assembling raw fluid system (mapped)...")
-        A_f, F_f = self.assemble_global_fluid_system() # Gets raw mapped A_f, F_f
+        A_f, F_f = self.assemble_global_fluid_system(volume_source) # Gets raw mapped A_f, F_f
         # u = torch.linalg.solve(A_f, F_f)
         print("[info] Assembling raw solid system (mapped)...")
         A_s, F_s = self.assemble_global_solid_system(E, nu, rho_s) # Gets raw mapped A_s, F_s
@@ -788,7 +794,7 @@ class CoupledFEMSolver(nn.Module):
         penalty = self.bcpenalty
 
         # Apply Fluid Inlet BC (p = source_value) - Dirichlet condition
-        print(f"[debug] Applying fluid inlet BC (p={source_value}) to {self.near_fluid_idx.shape[0]} global nodes...")
+        print(f"[debug] Applying fluid inlet BC (p={inlet_source}) to {self.near_fluid_idx.shape[0]} global nodes...")
         nodes_processed_by_inlet = set()
         for global_idx_tensor in self.near_fluid_idx:
              global_idx = global_idx_tensor.item()
@@ -798,7 +804,7 @@ class CoupledFEMSolver(nn.Module):
                      A_global[local_idx, :] = 0.0
                      A_global[:, local_idx] = 0.0
                      A_global[local_idx, local_idx] = penalty
-                     F_global[local_idx] = penalty * source_value
+                     F_global[local_idx] = penalty * inlet_source
                      nodes_processed_by_inlet.add(local_idx)
              else:
                  print(f"[warning] Inlet node {global_idx} not found in fluid_mapping.")
@@ -850,13 +856,30 @@ class CoupledFEMSolver(nn.Module):
 
         return A_global, F_global, N_fluid_unique, n_solid_dof # Return correct sizes
 
-    def solve(self, E, nu, rho_s):
+    def solve(self, E, nu, rho_s, volume_source=None):
         """
         给定材料参数，组装全局系统并求解，返回：
           - 预测远端麦克风处流体声压（取 fluid 域 x≈1.0 点平均）
           - 全局解向量 u（其中 u[0:n_nodes] 为 fluid 声压）
+          
+        Args:
+            E, nu, rho_s: 固体材料参数
+            volume_source: 体激励项，可以是常数或函数f(x,y,z)
+                           例如：constant_source = 10.0
+                           或者：def spatial_source(x, y, z): return 10.0 * np.exp(-(x**2 + y**2 + z**2))
+                           
+        Examples:
+            # 使用常数体激励项
+            solver.solve(E=1e9, nu=0.3, rho_s=1000.0, volume_source=10.0)
+            
+            # 使用空间变化的体激励项
+            def gaussian_source(x, y, z):
+                # 高斯分布的声源，在(0.5, 0, 0)位置最强
+                return 10.0 * torch.exp(-5*((x-0.5)**2 + y**2 + z**2))
+            
+            solver.solve(E=1e9, nu=0.3, rho_s=1000.0, volume_source=gaussian_source)
         """
-        A_global, F_global, N_fluid_unique, n_solid_dof_actual = self.assemble_global_system(E, nu, rho_s)
+        A_global, F_global, N_fluid_unique, n_solid_dof_actual = self.assemble_global_system(E, nu, rho_s, inlet_source=0.0, volume_source=volume_source)
         print("[info] 开始求解 (mapped system)")
         try:
             u = torch.linalg.lstsq(A_global, F_global).solution
@@ -883,11 +906,14 @@ class CoupledFEMSolver(nn.Module):
         else:
              print("[warning] Mic node index not defined.")
         print(f"[info] 预测远端麦克风处流体声压: {p_mic.squeeze()}")
-        exit(1)
         return p_mic.squeeze(), u # Return scalar p_mic
 
-    def assemble_global_fluid_system(self):
-        """ Assemble raw fluid system A_f, F_f (Helmholtz) using local fluid mapping """
+    def assemble_global_fluid_system(self, source_value=None):
+        """ Assemble raw fluid system A_f, F_f (Helmholtz) using local fluid mapping 
+        
+        Args:
+            source_value: 体激励项，可以是常数或者函数f(x,y,z)
+        """
         # Use pre-calculated sizes and mapping
         n_fluid_local_dof = self.N_fluid_unique # Size based on unique fluid nodes
         fluid_mapping = self.fluid_mapping
@@ -910,6 +936,30 @@ class CoupledFEMSolver(nn.Module):
                       col_idx = local_indices[c_local_map]
                       K_f[row_idx, col_idx] += K_e[r_local_map, c_local_map]
                       M_f[row_idx, col_idx] += M_e[r_local_map, c_local_map]
+            
+            # 如果提供了体激励项，计算体积并更新F_f
+            if source_value is not None:
+                # 计算四面体体积
+                v1 = coords[1] - coords[0]
+                v2 = coords[2] - coords[0]
+                v3 = coords[3] - coords[0]
+                tetra_vol = torch.abs(torch.dot(torch.cross(v1, v2), v3)) / 6.0
+                
+                # 计算四面体中心点
+                centroid = torch.mean(coords, dim=0)
+                
+                # 确定体激励项的值
+                if callable(source_value):
+                    # 如果体激励项是函数，在中心点求值
+                    src_val = source_value(centroid[0], centroid[1], centroid[2])
+                else:
+                    # 否则使用常数值
+                    src_val = source_value
+                
+                # 计算并应用到载荷向量
+                for r_local_map in range(4):
+                    row_idx = local_indices[r_local_map]
+                    F_f[row_idx] += tetra_vol * src_val / 4.0  # 平均分配到四个节点
 
         k_sq = (self.omega / self.c_f)**2
         A_f = K_f - k_sq * M_f

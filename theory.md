@@ -45,16 +45,22 @@
 
 ### 流体声学方程
 
-声学流体域由Helmholtz方程控制：
+声学流体域由包含体激励项的Helmholtz方程控制：
 
-$$\nabla^2 p + k^2 p = 0$$
+$$\nabla^2 p + k^2 p = f$$
 
 其中：
 - $p$ 是声压
 - $k = \omega/c_f$ 是波数
 - $c_f$ 是声波在流体中的传播速度（本例中空气声速为343 m/s）
 - $\omega = 2\pi f$ 是角频率
-- $f$ 是激励频率（Hz）
+- $f$ 是体积声源项或体激励项，可以表示分布在流体域中的声源
+
+当体激励项应用于有限元离散化时，它将影响系统的右侧载荷向量，计算方法为：
+
+$$F_i = \int_{\Omega_e} N_i f \, d\Omega \approx \frac{V}{4} f$$
+
+其中$V$是四面体单元的体积，体激励项$f$可以是空间的函数，也可以是常数。
 
 ### 固体弹性方程
 
@@ -267,10 +273,10 @@ $$A_{ii} = \beta, \quad F_i = \beta \cdot p_{prescribed}$$
 
 ### 流体部分
 
-1. 组装流体系统矩阵 $\mathbf{A}_f = \mathbf{K}_f - k^2 \mathbf{M}_f$：
+1. 组装流体系统矩阵 $\mathbf{A}_f = \mathbf{K}_f - k^2 \mathbf{M}_f$ 和包含体激励项的载荷向量 $\mathbf{F}_f$：
 
 ```python
-def assemble_global_fluid_system(self):
+def assemble_global_fluid_system(self, volume_source=None):
     # 使用预先计算的大小和映射
     n_fluid_local_dof = self.N_fluid_unique # 基于唯一流体节点的大小
     fluid_mapping = self.fluid_mapping
@@ -293,6 +299,30 @@ def assemble_global_fluid_system(self):
                   col_idx = local_indices[c_local_map]
                   K_f[row_idx, col_idx] += K_e[r_local_map, c_local_map]
                   M_f[row_idx, col_idx] += M_e[r_local_map, c_local_map]
+        
+        # 如果提供了体积激励项，计算体积并更新F_f
+        if volume_source is not None:
+            # 计算四面体体积
+            v1 = coords[1] - coords[0]
+            v2 = coords[2] - coords[0]
+            v3 = coords[3] - coords[0]
+            tetra_vol = torch.abs(torch.dot(torch.cross(v1, v2), v3)) / 6.0
+            
+            # 计算四面体中心点
+            centroid = torch.mean(coords, dim=0)
+            
+            # 确定体激励项的值
+            if callable(volume_source):
+                # 如果体激励项是函数，在中心点求值
+                src_val = volume_source(centroid[0], centroid[1], centroid[2])
+            else:
+                # 否则使用常数值
+                src_val = volume_source
+            
+            # 计算并应用到载荷向量
+            for r_local_map in range(4):
+                row_idx = local_indices[r_local_map]
+                F_f[row_idx] += tetra_vol * src_val / 4.0  # 平均分配到四个节点
 
     k_sq = (self.omega / self.c_f)**2
     A_f = K_f - k_sq * M_f

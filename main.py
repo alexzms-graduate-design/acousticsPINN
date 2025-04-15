@@ -10,14 +10,14 @@ print(f"Running on device: {device}")
 # -------------------------------
 # 设定基本参数
 # -------------------------------
-frequency = 1000.0       # 噪音源频率 (Hz)
+frequency = 10.0       # 噪音源频率 (Hz)
 penalty = 1e8            # 耦合惩罚参数
 mesh_file = "y_pipe.msh"   # 由 geometry_gmsh.py 生成的网格文件
 
 # -------------------------------
 # 初始化 FEM 求解器
 # -------------------------------
-fem_solver = CoupledFEMSolver(mesh_file, frequency=frequency, penalty=penalty).to(device)
+fem_solver = CoupledFEMSolver(mesh_file, frequency=frequency, cppenalty=penalty).to(device)
 
 # -------------------------------
 # 定义材料参数（作为待优化变量）
@@ -45,6 +45,7 @@ for epoch in range(n_epochs):
     optimizer.zero_grad()
     pred_pressure, _ = fem_solver.solve(E_param, nu_param, rho_param)
     loss = (pred_pressure - target_pressure)**2
+    print(f"[info] 预测压力: {pred_pressure.item():.6e}, 目标压力: {target_pressure.item():.6e}, 损失: {loss.item():.6e}")
     loss.backward()
     optimizer.step()
     # 保证泊松比在 (0, 0.5) 内

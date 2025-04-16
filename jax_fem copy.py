@@ -73,7 +73,7 @@ def elasticity_D_matrix(E, nu):
     """
     3D各向同性弹性材料 D 矩阵 (6x6)，Voigt 表示。
     """
-    coeff = jnp.exp(10*E) / ((1 + nu) * (1 - 2 * nu))
+    coeff = E / ((1 + nu) * (1 - 2 * nu))
     D = coeff * jnp.array([
         [1 - nu,    nu,    nu,       0,       0,       0],
         [nu,    1 - nu,    nu,       0,       0,       0],
@@ -129,7 +129,7 @@ def element_matrices_solid(coords, E, nu, rho_s):
     
     # 质量矩阵采用对角 lumped mass:
     # In JAX we need to construct this differently since we can't do in-place updates
-    m_lump = jnp.exp(rho_s) * V / 4.0
+    m_lump = rho_s * V / 4.0
     diag_blocks = []
     for i in range(4):
         diag_blocks.append((i*3, i*3+3, m_lump * jnp.eye(3, dtype=coords.dtype)))
@@ -146,12 +146,6 @@ def visualize_system(A, f, n_nodes, n_solid_dof, title_suffix="Raw System"):
     Visualizes the matrix A using colored scatter plot (log scale) and vector f as a heatmap.
     Marks the divisions between fluid and solid DOFs.
     """
-    # 检测是否在jit-trace中，如果在，则直接return
-    try:
-        _ = np.array(A)
-    except:
-        print(f"[Visualizing System] 在jit-trace中，跳过绘图.")
-        return
     print(f"[Visualizing System] 矩阵形状: {A.shape}, 向量形状: {f.shape}")
     print(f"[Visualizing System] 流体自由度(n_nodes): {n_nodes}, 固体自由度: {n_solid_dof}")
     total_dof = n_nodes + n_solid_dof
@@ -821,64 +815,99 @@ class CoupledFEMSolver:
         return A_f, F_f
 
     def assemble_global_solid_system(self, E, nu, rho_s):
-        # Preprocess to filter valid elements and convert to JAX arrays
-        solid_mapping = self.solid_mapping
-        valid_elements = []
-        valid_coords = []
-        
-        # Filter elements with all nodes in solid_mapping
-        for elem in tqdm(self.solid_elements, desc="组装固体系统", leave=False):
-            local_indices = []
-            elem_valid = True
-            for node in elem:
-                if int(node) not in solid_mapping:
-                    elem_valid = False
-                    break
-                local_indices.append(solid_mapping[int(node)])
-            if elem_valid and len(local_indices) == 4:
-                valid_elements.append(local_indices)
-                valid_coords.append([self.nodes[node] for node in elem])
-        
-        # Convert to JAX arrays
-        valid_elements = jnp.array(valid_elements, dtype=jnp.int32)
-        valid_coords = jnp.array(valid_coords, dtype=jnp.float32)
-        num_elements = valid_elements.shape[0]
-
-        # Batch compute element matrices using vmap
-        @jax.vmap
-        def compute_element_matrices(coords):
-            return element_matrices_solid(coords, E, nu, rho_s)
-        
-        K_es, M_es = compute_element_matrices(valid_coords)
-
-        # Generate global DOF indices for each element (12 DOFs per element)
-        dof_indices = 3 * valid_elements[..., None] + jnp.arange(3, dtype=jnp.int32)  # (num_elem, 4, 3)
-        dof_indices = dof_indices.reshape(num_elements, 12)  # (num_elem, 12)
-
-        # Generate all (row, col) combinations for 12x12 matrix
-        row_idx, col_idx = jnp.meshgrid(jnp.arange(12), jnp.arange(12), indexing='ij')
-        row_idx = row_idx.reshape(-1)
-        col_idx = col_idx.reshape(-1)
-
-        # Get global indices for all matrix entries
-        global_rows = dof_indices[:, row_idx].flatten()  # (num_elem*144,)
-        global_cols = dof_indices[:, col_idx].flatten()  # (num_elem*144,)
-        K_values = K_es[:, row_idx, col_idx].flatten()
-        M_values = M_es[:, row_idx, col_idx].flatten()
-
-        # Initialize matrices and perform scatter-add
+        """ Assemble raw solid system A_s, F_s using local solid mapping """
+        # Use pre-calculated sizes and mapping
         n_solid_dof = self.n_solid_dof
+        
+        # Initialize matrices with zeros
         K_s = jnp.zeros((n_solid_dof, n_solid_dof), dtype=jnp.float32)
         M_s = jnp.zeros((n_solid_dof, n_solid_dof), dtype=jnp.float32)
-        
-        K_s = K_s.at[(global_rows, global_cols)].add(K_values)
-        M_s = M_s.at[(global_rows, global_cols)].add(M_values)
-
-        # Calculate final system matrix
-        A_s = K_s - (self.omega ** 2) * M_s
         F_s = jnp.zeros(n_solid_dof, dtype=jnp.float32)
 
-        print("[debug] 优化版固体系统组装完成.")
+        print("[debug] 正在组装固体K_s和M_s(原始的，映射后)...")
+        
+        # Since we can't update matrices in-place in JAX, we'll collect triplets first 
+        # then assemble the matrices at the end
+        solid_mapping = self.solid_mapping
+        solid_elements_np = np.array(self.solid_elements)
+        nodes_np = np.array(self.nodes)
+        
+        # We'll collect triplets (row, col, value) for each contribution
+        K_triplets = []
+        M_triplets = []
+        
+        for elem_idx, elem in enumerate(tqdm(solid_elements_np, desc="组装固体K/M", leave=False)):
+            coords = nodes_np[elem]
+            
+            # Convert to JAX array for the element matrix calculation
+            K_e, M_e = element_matrices_solid(jnp.array(coords), E, nu, rho_s)
+            K_e_np = np.array(K_e)
+            M_e_np = np.array(M_e)
+            
+            # Map global element indices to local solid indices
+            local_solid_indices = [solid_mapping[int(glob_idx)] for glob_idx in elem if int(glob_idx) in solid_mapping]
+            
+            # Skip this element if not all nodes are in solid_mapping
+            if len(local_solid_indices) != 4:
+                print(f"[Warning] 固体单元{elem}中有节点不在solid_mapping中?")
+                continue
+                
+            # For each pair of nodes, add the corresponding 3x3 block
+            for r_local_map in range(4):
+                solid_idx_r = local_solid_indices[r_local_map]
+                r_start = solid_idx_r * 3
+                r_end = (solid_idx_r + 1) * 3
+                
+                for c_local_map in range(4):
+                    solid_idx_c = local_solid_indices[c_local_map]
+                    c_start = solid_idx_c * 3
+                    c_end = (solid_idx_c + 1) * 3
+                    
+                    # Get the 3x3 block from K_e and M_e
+                    K_block = K_e_np[r_local_map*3 : (r_local_map+1)*3, c_local_map*3 : (c_local_map+1)*3]
+                    M_block = M_e_np[r_local_map*3 : (r_local_map+1)*3, c_local_map*3 : (c_local_map+1)*3]
+                    
+                    # Add each element of the 3x3 block as a triplet
+                    for i in range(3):
+                        for j in range(3):
+                            row_idx = r_start + i
+                            col_idx = c_start + j
+                            K_triplets.append((row_idx, col_idx, K_block[i, j]))
+                            M_triplets.append((row_idx, col_idx, M_block[i, j]))
+        
+        # Sort triplets by row, then col for more efficient iteration
+        K_triplets.sort(key=lambda x: (x[0], x[1]))
+        M_triplets.sort(key=lambda x: (x[0], x[1]))
+        
+        # Create dense matrices from triplets (additive assembly)
+        # In JAX, we'll use a vectorized approach for better performance
+        # Extract rows, columns, and values from triplets
+        if K_triplets:
+            rows_K = jnp.array([t[0] for t in K_triplets])
+            cols_K = jnp.array([t[1] for t in K_triplets])
+            vals_K = jnp.array([t[2] for t in K_triplets])
+            
+            # Convert 2D indices to flat indices for scatter operation
+            K_indices = rows_K * n_solid_dof + cols_K
+            K_flat = jnp.zeros(n_solid_dof * n_solid_dof, dtype=jnp.float32)
+            K_flat = K_flat.at[K_indices].add(vals_K)
+            K_s = K_flat.reshape(n_solid_dof, n_solid_dof)
+        
+        if M_triplets:
+            rows_M = jnp.array([t[0] for t in M_triplets])
+            cols_M = jnp.array([t[1] for t in M_triplets])
+            vals_M = jnp.array([t[2] for t in M_triplets])
+            
+            # Convert 2D indices to flat indices for scatter operation
+            M_indices = rows_M * n_solid_dof + cols_M
+            M_flat = jnp.zeros(n_solid_dof * n_solid_dof, dtype=jnp.float32)
+            M_flat = M_flat.at[M_indices].add(vals_M)
+            M_s = M_flat.reshape(n_solid_dof, n_solid_dof)
+
+        # Calculate A_s = K_s - omega^2 * M_s
+        A_s = K_s - (self.omega**2) * M_s
+        
+        print("[debug] 原始固体系统组装完成.")
         return A_s, F_s
 
     def assemble_global_system(self, E, nu, rho_s, inlet_source=1.0, volume_source=None):
@@ -898,10 +927,11 @@ class CoupledFEMSolver:
         # ---- Raw System Assembly ----
         print("[info] 正在组装原始流体系统(映射后)...")
         A_f, F_f = self.assemble_global_fluid_system(volume_source) # Gets raw mapped A_f, F_f
-        visualize_system(A_f, F_f, N_fluid_unique, n_solid_dof, title_suffix="Raw Fluid System Mapped")
         
         print("[info] 正在组装原始固体系统(映射后)...")
         A_s, F_s = self.assemble_global_solid_system(E, nu, rho_s) # Gets raw mapped A_s, F_s
+        
+        visualize_system(A_f, F_f, N_fluid_unique, n_solid_dof, title_suffix="Raw Fluid System Mapped")
         visualize_system(A_s, F_s, n_solid_dof, N_fluid_unique, title_suffix="Raw Solid System Mapped")
         
         # ---- Assemble Coupling Matrices (Using Mappings) ----

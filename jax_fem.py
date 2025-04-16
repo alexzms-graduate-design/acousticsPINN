@@ -1,6 +1,8 @@
-# fem.py
-import torch
-import torch.nn as nn
+# jax_fem.py
+import jax
+import jax.numpy as jnp
+from jax import grad, jit, vmap
+from functools import partial
 import numpy as np
 import meshio
 from tqdm import tqdm
@@ -9,7 +11,6 @@ import matplotlib.pyplot as plt
 import scipy.sparse as sps
 import matplotlib.colors as mcolors # For LogNorm
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # 管道参数定义
 r_outer = 0.05   # 外半径 5cm
 r_inner = 0.045  # 内半径 4.5cm
@@ -19,12 +20,13 @@ x_junction = 0.5   # Junction point x-coordinate
 # Branch length MUST match the value used in geometry_gmsh.py
 length_branch = 0.3 
 
-# Add rho_f near the top definitions or pass it
+# 定义流体密度
 rho_f = 1.225 # kg/m^3 (Air density)
 
 # ===============================
 # 辅助函数：线性四面体元的计算
 # ===============================
+@jit
 def compute_tetra_volume(coords):
     """
     计算四面体体积
@@ -34,22 +36,25 @@ def compute_tetra_volume(coords):
     v0 = coords[1] - coords[0]
     v1 = coords[2] - coords[0]
     v2 = coords[3] - coords[0]
-    vol = torch.abs(torch.det(torch.stack([v0, v1, v2], dim=1))) / 6.0
+    # 使用叉积和点积计算混合积
+    vol = jnp.abs(jnp.dot(jnp.cross(v0, v1), v2)) / 6.0
     return vol
 
+@jit
 def compute_shape_function_gradients(coords):
     """
     计算四面体线性形函数梯度（常数）。
     方法：对齐次线性系统 [1 x y z] 的逆矩阵的后三行。
     返回: [4,3]，每一行为对应节点形函数在 x,y,z 方向的梯度。
     """
-    ones = torch.ones((4,1), dtype=coords.dtype, device=coords.device)
-    A = torch.cat([ones, coords], dim=1)  # [4,4]
-    A_inv = torch.inverse(A)
+    ones = jnp.ones((4,1))
+    A = jnp.concatenate([ones, coords], axis=1)  # [4,4]
+    A_inv = jnp.linalg.inv(A)
     # 后三行为 b, c, d 系数，对应梯度
-    grads = A_inv[1:,:].transpose(0,1)   # shape [4,3]
+    grads = jnp.transpose(A_inv[1:,:])   # shape [4,3]
     return grads
 
+@jit
 def element_matrices_fluid(coords):
     """
     计算流体四面体单元的局部刚度和质量矩阵。
@@ -59,45 +64,52 @@ def element_matrices_fluid(coords):
     """
     V = compute_tetra_volume(coords)
     grads = compute_shape_function_gradients(coords)  # [4,3]
-    K_e = V * (grads @ grads.transpose(0,1))
-    ones_4 = torch.ones((4,4), dtype=coords.dtype, device=coords.device)
-    M_e = V / 20.0 * (torch.eye(4, dtype=coords.dtype, device=coords.device) + ones_4)
+    K_e = V * (grads @ grads.transpose())
+    ones_4 = jnp.ones((4,4))
+    M_e = V / 20.0 * (jnp.eye(4) + ones_4)
     return K_e, M_e
 
+@jit
 def elasticity_D_matrix(E, nu):
     """
     3D各向同性弹性材料 D 矩阵 (6x6)，Voigt 表示。
     """
     coeff = E / ((1 + nu) * (1 - 2 * nu))
-    D = coeff * torch.tensor([
+    D = coeff * jnp.array([
         [1 - nu,    nu,    nu,       0,       0,       0],
         [nu,    1 - nu,    nu,       0,       0,       0],
         [nu,      nu,  1 - nu,       0,       0,       0],
         [0,       0,      0,  (1 - 2 * nu) / 2,  0,       0],
         [0,       0,      0,       0,  (1 - 2 * nu) / 2,  0],
         [0,       0,      0,       0,       0,  (1 - 2 * nu) / 2]
-    ], dtype=torch.float32, device=E.device)
+    ])
     return D
 
+@jit
 def compute_B_matrix(coords):
     """
     构造四面体单元的应变-位移矩阵 B (6 x 12)。
     利用线性形函数梯度计算，各节点 3 dof。
     """
     grads = compute_shape_function_gradients(coords)  # [4,3]
-    B = torch.zeros((6, 12), dtype=coords.dtype, device=coords.device)
+    B = jnp.zeros((6, 12))
+    
+    # 对每个节点分别构造B矩阵块
     for i in range(4):
         bx, by, bz = grads[i]
-        B[:, i*3:(i+1)*3] = torch.tensor([
-            [bx,    0,    0],
-            [0,   by,     0],
-            [0,    0,    bz],
-            [by,   bx,    0],
-            [0,    bz,   by],
-            [bz,   0,    bx]
-        ], dtype=coords.dtype, device=coords.device)
+        B_i = jnp.array([
+            [bx,   0,    0],
+            [0,   by,    0],
+            [0,    0,   bz],
+            [by,  bx,    0],
+            [0,   bz,   by],
+            [bz,   0,   bx]
+        ])
+        B = B.at[:, i*3:(i+1)*3].set(B_i)
+    
     return B
 
+@jit
 def element_matrices_solid(coords, E, nu, rho_s):
     """
     计算固体四面体单元（管壁）的局部刚度和质量矩阵。
@@ -107,12 +119,18 @@ def element_matrices_solid(coords, E, nu, rho_s):
     B = compute_B_matrix(coords)  # [6, 12]
     D = elasticity_D_matrix(E, nu)  # [6,6]
     # 刚度矩阵：K_e = V * B^T D B
-    K_e = V * (B.transpose(0,1) @ (D @ B))
+    K_e = V * (B.transpose() @ (D @ B))
     # 质量矩阵采用对角 lumped mass:
-    M_e = torch.zeros((12, 12), dtype=coords.dtype, device=coords.device)
+    M_e = jnp.zeros((12, 12))
     m_lump = rho_s * V / 4.0
+    
+    # 构造对角块质量矩阵
     for i in range(4):
-        M_e[i*3:(i+1)*3, i*3:(i+1)*3] = m_lump * torch.eye(3, dtype=coords.dtype, device=coords.device)
+        start_idx = i*3
+        end_idx = (i+1)*3
+        M_e_block = m_lump * jnp.eye(3)
+        M_e = M_e.at[start_idx:end_idx, start_idx:end_idx].set(M_e_block)
+    
     return K_e, M_e
 
 def visualize_system(A, f, n_nodes, n_solid_dof, title_suffix="Raw System"):
@@ -123,19 +141,24 @@ def visualize_system(A, f, n_nodes, n_solid_dof, title_suffix="Raw System"):
     print(f"[Visualizing System] 矩阵形状: {A.shape}, 向量形状: {f.shape}")
     print(f"[Visualizing System] 流体自由度(n_nodes): {n_nodes}, 固体自由度: {n_solid_dof}")
     total_dof = n_nodes + n_solid_dof
-    if A.shape[0] != total_dof or A.shape[1] != total_dof or f.shape[0] != total_dof:
-        print(f"[Warning] visualize_system中的维度不匹配: A={A.shape}, f={f.shape}, 预期总自由度={total_dof}")
-        actual_total_dof = A.shape[0]
+    
+    # 将JAX数组转换为NumPy供可视化使用
+    if hasattr(A, 'device_buffer'):
+        A_np = np.array(A)
+        f_np = np.array(f)
+    else:
+        A_np = A
+        f_np = f
+    
+    if A_np.shape[0] != total_dof or A_np.shape[1] != total_dof or f_np.shape[0] != total_dof:
+        print(f"[Warning] visualize_system中的维度不匹配: A={A_np.shape}, f={f_np.shape}, 预期总自由度={total_dof}")
+        actual_total_dof = A_np.shape[0]
         if n_nodes > actual_total_dof: n_nodes = actual_total_dof
     else:
         actual_total_dof = total_dof
 
-    # Move data to CPU
-    A_cpu = A.detach().cpu()
-    f_cpu = f.detach().cpu().numpy()
-
-    # Convert dense torch tensor to scipy sparse COO matrix for easier access to values/coords
-    A_sparse_coo = sps.coo_matrix(A_cpu)
+    # Convert dense array to scipy sparse COO matrix for easier access to values/coords
+    A_sparse_coo = sps.coo_matrix(A_np)
     
     # Filter out small values based on tolerance
     tol = 1e-9
@@ -145,7 +168,7 @@ def visualize_system(A, f, n_nodes, n_solid_dof, title_suffix="Raw System"):
     data = A_sparse_coo.data[mask]
     
     num_non_zero = len(data)
-    print(f"[Visualizing System] 矩阵稀疏度: {num_non_zero / (A.shape[0] * A.shape[1]) * 100:.4f}% 非零元素 > {tol}.")
+    print(f"[Visualizing System] 矩阵稀疏度: {num_non_zero / (A_np.shape[0] * A_np.shape[1]) * 100:.4f}% 非零元素 > {tol}.")
     
     if num_non_zero == 0:
         print("[Warning] 矩阵A中未找到非零元素(高于阈值)，跳过绘图.")
@@ -170,11 +193,11 @@ def visualize_system(A, f, n_nodes, n_solid_dof, title_suffix="Raw System"):
     # Scatter plot: row index vs column index, colored by value magnitude
     # Invert row axis to match matrix layout (optional)
     scatter = ax.scatter(col, row, c=abs_data, cmap=cmap, norm=norm, s=0.5, marker='.') # Use small dots
-    ax.set_title(f"Matrix A ({A.shape[0]}x{A.shape[1]}) Non-Zero Elements (Log Color Scale)")
+    ax.set_title(f"Matrix A ({A_np.shape[0]}x{A_np.shape[1]}) Non-Zero Elements (Log Color Scale)")
     ax.set_xlabel("Column Index")
     ax.set_ylabel("Row Index")
-    ax.set_xlim(-0.5, A.shape[1]-0.5) # Adjust xlim slightly for text
-    ax.set_ylim(A.shape[0]-0.5, -0.5) # Adjust ylim slightly for text
+    ax.set_xlim(-0.5, A_np.shape[1]-0.5) # Adjust xlim slightly for text
+    ax.set_ylim(A_np.shape[0]-0.5, -0.5) # Adjust ylim slightly for text
     ax.set_aspect('equal')
     ax.grid(True, linestyle=':', linewidth=0.5)
 
@@ -193,19 +216,13 @@ def visualize_system(A, f, n_nodes, n_solid_dof, title_suffix="Raw System"):
         ax.text((n_nodes + n_solid_dof / 2) / actual_total_dof, 1.02, 'Solid DOFs', ha='center', va='bottom', transform=ax.transAxes, color='red', fontsize=9)
         ax.text(-0.02, (n_nodes / 2) / actual_total_dof, 'Fluid DOFs', rotation=90, ha='right', va='center', transform=ax.transAxes, color='red', fontsize=9)
         ax.text(-0.02, (n_nodes + n_solid_dof / 2) / actual_total_dof, 'Solid DOFs', rotation=90, ha='right', va='center', transform=ax.transAxes, color='red', fontsize=9)
-        
-        # Optional block labels inside plot
-        # ax.text(n_nodes / 2, n_nodes / 2, 'A_f', va='center', ha='center', color='white', fontsize=8, bbox=dict(facecolor='black', alpha=0.5, pad=0.1))
-        # ax.text(n_nodes / 2, n_nodes + n_solid_dof / 2, 'C_sf', va='center', ha='center', color='white', fontsize=8, bbox=dict(facecolor='black', alpha=0.5, pad=0.1))
-        # ax.text(n_nodes + n_solid_dof / 2, n_nodes / 2, 'C_fs', va='center', ha='center', color='white', fontsize=8, bbox=dict(facecolor='black', alpha=0.5, pad=0.1))
-        # ax.text(n_nodes + n_solid_dof / 2, n_nodes + n_solid_dof / 2, 'A_s', va='center', ha='center', color='white', fontsize=8, bbox=dict(facecolor='black', alpha=0.5, pad=0.1))
 
     # --- Force Vector Plot (Heatmap) ---
     ax = axs[1]
-    # Reshape f_cpu to (N, 1) for matshow
-    f_plot = f_cpu.reshape(-1, 1)
+    # Reshape f_np to (N, 1) for matshow
+    f_plot = f_np.reshape(-1, 1)
     img = ax.matshow(f_plot, cmap='coolwarm', aspect='auto') # Use 'auto' aspect for vector
-    ax.set_title(f"Vector f ({f.shape[0]}x1)")
+    ax.set_title(f"Vector f ({f_np.shape[0]}x1)")
     ax.set_xlabel("Column")
     ax.set_ylabel("Index")
     # Disable x-axis ticks/labels as it's just one column
@@ -228,31 +245,29 @@ def visualize_system(A, f, n_nodes, n_solid_dof, title_suffix="Raw System"):
     save_path = f'system_visualization_{title_suffix.replace(" ", "_")}.png'
     plt.savefig(save_path, dpi=150)
     print(f"[Visualizing System] 图表已保存到 {save_path}")
-    plt.close(fig)
+    plt.close(fig) 
 
 # ===============================
 # Coupled FEM 求解器（全局组装、求解及后处理）
 # ===============================
-class CoupledFEMSolver(nn.Module):
+class CoupledFEMSolver:
     def __init__(self, mesh_file, frequency=1000.0, cppenalty=1e8, bcpenalty=1e6):
         """
         mesh_file: "y_pipe.msh" 路径
         frequency: 噪音源频率 (Hz)
         penalty: 流固耦合惩罚参数 β
         """
-        super(CoupledFEMSolver, self).__init__()
         self.freq = frequency
         self.omega = 2 * np.pi * frequency
         self.c_f = 343.0
         self.cppenalty = cppenalty
         self.bcpenalty = bcpenalty
         
-
         # 读网格文件（使用 meshio ）
         print(f"[info] 正在读取网格文件: {mesh_file}")
         mesh = meshio.read(mesh_file)
         # 提取节点（3D 坐标）
-        self.nodes = torch.tensor(mesh.points[:, :3], dtype=torch.float32, device=device)
+        self.nodes = jnp.array(mesh.points[:, :3])
         
         # 检查是否存在四面体单元和物理标签
         if not hasattr(mesh, 'cells'):
@@ -330,22 +345,29 @@ class CoupledFEMSolver(nn.Module):
             solid_elems_np = np.array([], dtype=np.int64).reshape(0, 4)
             print("[warning] 未找到固体单元!")
         
-        self.fluid_elements = torch.tensor(fluid_elems_np, dtype=torch.long, device=device)
-        self.solid_elements = torch.tensor(solid_elems_np, dtype=torch.long, device=device)
+        self.fluid_elements = jnp.array(fluid_elems_np, dtype=jnp.int32)
+        self.solid_elements = jnp.array(solid_elems_np, dtype=jnp.int32)
 
         print(f"[info] 加载了 {self.fluid_elements.shape[0]} 个流体单元 (tag {fluid_tag}) 和 {self.solid_elements.shape[0]} 个固体单元 (tag {solid_tag}).")
 
         # --- 创建节点映射 ---
-        self.fluid_unique_nodes, fluid_inverse_indices = torch.unique(self.fluid_elements.flatten(), return_inverse=True)
-        self.solid_unique_nodes, solid_inverse_indices = torch.unique(self.solid_elements.flatten(), return_inverse=True)
+        # 在JAX中要使用numpy处理唯一值和索引创建
+        fluid_elements_flat = self.fluid_elements.flatten()
+        solid_elements_flat = self.solid_elements.flatten()
+        
+        fluid_unique_nodes, fluid_inverse_indices = np.unique(np.array(fluid_elements_flat), return_inverse=True)
+        solid_unique_nodes, solid_inverse_indices = np.unique(np.array(solid_elements_flat), return_inverse=True)
+        
+        self.fluid_unique_nodes = jnp.array(fluid_unique_nodes)
+        self.solid_unique_nodes = jnp.array(solid_unique_nodes)
 
         self.N_fluid_unique = len(self.fluid_unique_nodes)
         self.N_solid_unique = len(self.solid_unique_nodes)
         self.n_solid_dof = self.N_solid_unique * 3
 
-        # 全局索引 -> 局部索引映射
-        self.fluid_mapping = {global_idx.item(): local_idx for local_idx, global_idx in enumerate(self.fluid_unique_nodes)}
-        self.solid_mapping = {global_idx.item(): local_idx for local_idx, global_idx in enumerate(self.solid_unique_nodes)}
+        # 全局索引 -> 局部索引映射字典
+        self.fluid_mapping = {int(global_idx): local_idx for local_idx, global_idx in enumerate(fluid_unique_nodes)}
+        self.solid_mapping = {int(global_idx): local_idx for local_idx, global_idx in enumerate(solid_unique_nodes)}
 
         print(f"[info] 找到 {self.N_fluid_unique} 个唯一流体节点和 {self.N_solid_unique} 个唯一固体节点 ({self.n_solid_dof} 个固体自由度).")
         
@@ -367,41 +389,47 @@ class CoupledFEMSolver(nn.Module):
                             for node_idx in cell_block.data.flatten():
                                 interface_nodes_set.add(node_idx)
             
-            # 转换为tensor
-            self.interface_idx = torch.tensor(list(interface_nodes_set), dtype=torch.long, device=device)
+            # 转换为array
+            self.interface_idx = jnp.array(list(interface_nodes_set), dtype=jnp.int32)
             print(f"[info] 从界面物理组找到 {len(interface_nodes_set)} 个流固界面节点")
         else:
             # 如果找不到界面物理组，退回到找流体和固体共享的节点
             print("[info] 未找到界面物理组，退回到通过流体和固体共享节点识别界面...")
-            fluid_node_set = set(self.fluid_unique_nodes.cpu().numpy())
-            solid_node_set = set(self.solid_unique_nodes.cpu().numpy())
+            fluid_node_set = set(np.array(self.fluid_unique_nodes))
+            solid_node_set = set(np.array(self.solid_unique_nodes))
             interface_node_set = fluid_node_set.intersection(solid_node_set)
-            self.interface_idx = torch.tensor(list(interface_node_set), dtype=torch.long, device=device)
+            self.interface_idx = jnp.array(list(interface_node_set), dtype=jnp.int32)
             print(f"[info] 找到 {len(interface_node_set)} 个流固界面共享节点")
 
         # --- 计算界面法向量 ---
         print("[info] 计算界面法向量...")
-        node_to_face_normals = {node_id.item(): [] for node_id in self.interface_idx}
-
+        # 创建界面节点到法向量的映射（使用Python字典）
+        node_to_face_normals = {int(node_id): [] for node_id in self.interface_idx}
+        
+        # 由于JAX的函数式特性，这部分计算保留使用循环
+        fluid_elements_np = np.array(self.fluid_elements)
+        nodes_np = np.array(self.nodes)
+        interface_idx_np = np.array(self.interface_idx)
+        
         # 迭代流体单元找到界面面及其法向量
-        for elem_nodes in tqdm(self.fluid_elements, desc="计算界面法向量"):
-            nodes_coords = self.nodes[elem_nodes]  # 4个节点坐标
+        for elem_nodes in tqdm(fluid_elements_np, desc="计算界面法向量"):
+            nodes_coords = nodes_np[elem_nodes]  # 4个节点坐标
             # 定义四个面（局部索引）
             local_faces = [(0, 1, 2), (0, 3, 1), (0, 2, 3), (1, 3, 2)]
 
             for i_face, local_face in enumerate(local_faces):
-                global_node_indices = elem_nodes[torch.tensor(local_face, device=elem_nodes.device)] # 面的全局节点索引
-
+                global_node_indices = np.array([elem_nodes[i] for i in local_face])  # 面的全局节点索引
+                
                 # 检查是否所有3个节点都是界面节点
-                is_interface_face = all(node_id.item() in node_to_face_normals for node_id in global_node_indices)
+                is_interface_face = all(node in node_to_face_normals for node in global_node_indices)
 
                 if is_interface_face:
                     # 计算面法向量
-                    p0, p1, p2 = self.nodes[global_node_indices]
+                    p0, p1, p2 = nodes_np[global_node_indices]
                     v1 = p1 - p0
                     v2 = p2 - p0
-                    normal = torch.cross(v1, v2)
-                    norm_mag = torch.norm(normal)
+                    normal = np.cross(v1, v2)
+                    norm_mag = np.linalg.norm(normal)
 
                     if norm_mag > 1e-12: # 避免除以零
                         normal = normal / norm_mag
@@ -413,30 +441,29 @@ class CoupledFEMSolver(nn.Module):
                         vec_to_p3 = p3 - face_centroid
 
                         # 如果法向量指向p3（内部），翻转它
-                        if torch.dot(normal, vec_to_p3) > 0:
+                        if np.dot(normal, vec_to_p3) > 0:
                             normal = -normal
 
                         # 将面法向量添加到其3个顶点的列表中
-                        for node_id_tensor in global_node_indices:
-                            node_id = node_id_tensor.item()
+                        for node_id in global_node_indices:
                             if node_id in node_to_face_normals:
                                 node_to_face_normals[node_id].append(normal)
 
         # 通过平均计算最终顶点法向量
         final_normals_list = []
         zero_normal_count = 0
-        for node_id_tensor in tqdm(self.interface_idx, desc="平均节点法向量"):
-            node_id = node_id_tensor.item()
+        
+        for node_id in tqdm(interface_idx_np, desc="平均节点法向量"):
             normals_to_average = node_to_face_normals.get(node_id, [])
 
             if not normals_to_average:
-                avg_normal = torch.zeros(3, device=device)
+                avg_normal = np.zeros(3)
                 zero_normal_count += 1
             else:
-                avg_normal = torch.sum(torch.stack(normals_to_average), dim=0)
-                norm_val = torch.norm(avg_normal)
+                avg_normal = np.sum(normals_to_average, axis=0)
+                norm_val = np.linalg.norm(avg_normal)
                 if norm_val < 1e-12:
-                    avg_normal = torch.zeros(3, device=device)
+                    avg_normal = np.zeros(3)
                     zero_normal_count += 1
                 else:
                     avg_normal = avg_normal / norm_val
@@ -445,154 +472,160 @@ class CoupledFEMSolver(nn.Module):
         if zero_normal_count > 0:
             print(f"[warning] {zero_normal_count} 个界面节点的法向量为零.")
             
-        self.interface_normals = torch.stack(final_normals_list, dim=0)
+        self.interface_normals = jnp.array(final_normals_list)
         
         # 过滤掉法向量为零的节点
-        normal_magnitudes = torch.linalg.norm(self.interface_normals, dim=1)
+        # 由于JAX数组不可变，这里先用NumPy处理
+        normal_magnitudes = np.linalg.norm(np.array(self.interface_normals), axis=1)
         norm_tolerance = 1e-9
         valid_normal_mask = normal_magnitudes > norm_tolerance
         
-        original_count = self.interface_idx.shape[0]
-        self.interface_idx = self.interface_idx[valid_normal_mask]
-        self.interface_normals = self.interface_normals[valid_normal_mask]
+        original_count = len(self.interface_idx)
+        self.interface_idx = jnp.array(np.array(self.interface_idx)[valid_normal_mask])
+        self.interface_normals = jnp.array(np.array(self.interface_normals)[valid_normal_mask])
         
-        filtered_count = self.interface_idx.shape[0]
+        filtered_count = len(self.interface_idx)
         removed_count = original_count - filtered_count
         if removed_count > 0:
             print(f"[info] 移除了 {removed_count} 个法向量无效的界面节点 (norm < {norm_tolerance}).")
         print(f"[info] 最终界面节点数量: {filtered_count}")
         
         # 创建界面节点集合，用于排除它们不被用作其他边界条件
-        interface_nodes_set = set(self.interface_idx.cpu().numpy())
+        interface_nodes_set = set(np.array(self.interface_idx))
 
         # --- Inlet/Outlet Definitions ---
+        # 为了保持与原版一致的功能，边界处理部分保留NumPy实现
+        nodes_np = np.array(self.nodes)
+        fluid_unique_nodes_np = np.array(self.fluid_unique_nodes)
+        
         # 设置入口条件（x ≈ 0）- 确保它们是流体节点，但不是界面节点
-        # Inlet (x approx 0) - Ensure they are fluid nodes but not interface nodes
-        potential_near_indices = torch.nonzero(torch.abs(self.nodes[:, 0]) < 1e-3).squeeze()
-        near_mask = torch.isin(potential_near_indices, self.fluid_unique_nodes)
+        potential_near_indices = np.nonzero(np.abs(nodes_np[:, 0]) < 1e-3)[0]
+        near_mask = np.isin(potential_near_indices, fluid_unique_nodes_np)
         near_fluid_candidates = potential_near_indices[near_mask]
         # 排除界面节点
-        non_interface_mask = torch.tensor([idx.item() not in interface_nodes_set for idx in near_fluid_candidates], device=device)
-        self.near_fluid_idx = near_fluid_candidates[non_interface_mask]
-        print(f"[info] 识别入口节点: 总共 {near_fluid_candidates.shape[0]} 个候选节点, 排除 {near_fluid_candidates.shape[0] - self.near_fluid_idx.shape[0]} 个界面节点, 最终 {self.near_fluid_idx.shape[0]} 个入口节点")
+        non_interface_mask = np.array([idx not in interface_nodes_set for idx in near_fluid_candidates])
+        self.near_fluid_idx = jnp.array(near_fluid_candidates[non_interface_mask])
+        print(f"[info] 识别入口节点: 总共 {len(near_fluid_candidates)} 个候选节点, 排除 {len(near_fluid_candidates) - len(self.near_fluid_idx)} 个界面节点, 最终 {len(self.near_fluid_idx)} 个入口节点")
 
         # 设置主管道出口条件（x ≈ length_main）- 确保它们是流体节点，但不是界面节点
-        # Main Outlet (x approx length_main) - Ensure they are fluid nodes but not interface nodes
         outlet_tolerance = 1e-3
-        potential_main_outlet_indices = torch.nonzero(torch.abs(self.nodes[:, 0] - length_main) < outlet_tolerance).squeeze()
-        main_outlet_mask = torch.isin(potential_main_outlet_indices, self.fluid_unique_nodes)
+        potential_main_outlet_indices = np.nonzero(np.abs(nodes_np[:, 0] - length_main) < outlet_tolerance)[0]
+        main_outlet_mask = np.isin(potential_main_outlet_indices, fluid_unique_nodes_np)
         main_outlet_candidates = potential_main_outlet_indices[main_outlet_mask]
         # 排除界面节点
-        non_interface_mask = torch.tensor([idx.item() not in interface_nodes_set for idx in main_outlet_candidates], device=device)
+        non_interface_mask = np.array([idx not in interface_nodes_set for idx in main_outlet_candidates])
         main_outlet_idx = main_outlet_candidates[non_interface_mask]
-        print(f"[info] 识别主管道出口节点: 总共 {main_outlet_candidates.shape[0]} 个候选节点, 排除 {main_outlet_candidates.shape[0] - main_outlet_idx.shape[0]} 个界面节点")
+        print(f"[info] 识别主管道出口节点: 总共 {len(main_outlet_candidates)} 个候选节点, 排除 {len(main_outlet_candidates) - len(main_outlet_idx)} 个界面节点")
 
         # 设置分支出口条件（在分支末端平面）- 确保它们是流体节点，但不是界面节点
-        P_junction = torch.tensor([x_junction, 0.0, 0.0], device=device)
-        angle_rad = torch.deg2rad(torch.tensor(180 - angle_deg, device=device))
-        V_branch_axis = torch.tensor([torch.cos(angle_rad), torch.sin(angle_rad), 0.0], device=device)
+        P_junction = np.array([x_junction, 0.0, 0.0])
+        angle_rad = np.deg2rad(180 - angle_deg)
+        V_branch_axis = np.array([np.cos(angle_rad), np.sin(angle_rad), 0.0])
         
         P_branch_end = P_junction + length_branch * V_branch_axis
         # 距离分支末端平面近的节点: abs(dot(P - P_branch_end, V_branch_axis)) < tol
-        dist_to_branch_end_plane = torch.abs(torch.einsum('nd,d->n', self.nodes - P_branch_end, V_branch_axis))
+        dist_to_branch_end_plane = np.abs(np.einsum('nd,d->n', nodes_np - P_branch_end, V_branch_axis))
         
         # 节点也需要在分支管道半径内: 到轴线的距离 <= r_inner + tol
         # 计算到分支轴线的垂直距离
-        Vec_P_all = self.nodes - P_junction
-        proj_dist_branch = torch.einsum('nd,d->n', Vec_P_all, V_branch_axis)
-        Vec_proj = proj_dist_branch.unsqueeze(1) * V_branch_axis.unsqueeze(0)
-        perp_dist_branch = torch.norm(Vec_P_all - Vec_proj, dim=1)
+        Vec_P_all = nodes_np - P_junction
+        proj_dist_branch = np.einsum('nd,d->n', Vec_P_all, V_branch_axis)
+        Vec_proj = proj_dist_branch[:, np.newaxis] * V_branch_axis[np.newaxis, :]
+        perp_dist_branch = np.linalg.norm(Vec_P_all - Vec_proj, axis=1)
         
         branch_outlet_mask = (dist_to_branch_end_plane < outlet_tolerance) & \
                              (perp_dist_branch <= r_inner + outlet_tolerance) & \
                              (proj_dist_branch > 0)  # 确保在分支一侧
 
-        potential_branch_outlet_indices = torch.nonzero(branch_outlet_mask).squeeze()
-        branch_outlet_fluid_mask = torch.isin(potential_branch_outlet_indices, self.fluid_unique_nodes)
+        potential_branch_outlet_indices = np.nonzero(branch_outlet_mask)[0]
+        branch_outlet_fluid_mask = np.isin(potential_branch_outlet_indices, fluid_unique_nodes_np)
         branch_outlet_candidates = potential_branch_outlet_indices[branch_outlet_fluid_mask]
         # 排除界面节点
-        non_interface_mask = torch.tensor([idx.item() not in interface_nodes_set for idx in branch_outlet_candidates], device=device)
+        non_interface_mask = np.array([idx not in interface_nodes_set for idx in branch_outlet_candidates])
         branch_outlet_idx = branch_outlet_candidates[non_interface_mask]
-        print(f"[info] 识别分支出口节点: 总共 {branch_outlet_candidates.shape[0]} 个候选节点, 排除 {branch_outlet_candidates.shape[0] - branch_outlet_idx.shape[0]} 个界面节点")
+        print(f"[info] 识别分支出口节点: 总共 {len(branch_outlet_candidates)} 个候选节点, 排除 {len(branch_outlet_candidates) - len(branch_outlet_idx)} 个界面节点")
         
         # 合并主管道和分支管道出口
-        combined_outlet_idx = torch.cat((main_outlet_idx, branch_outlet_idx))
-        self.outlet_fluid_idx = torch.unique(combined_outlet_idx)
-        print(f"[info] 最终出口节点总数: {self.outlet_fluid_idx.shape[0]}")
+        combined_outlet_idx = np.concatenate((main_outlet_idx, branch_outlet_idx))
+        self.outlet_fluid_idx = jnp.array(np.unique(combined_outlet_idx))
+        print(f"[info] 最终出口节点总数: {len(self.outlet_fluid_idx)}")
         
         # 定义麦克风节点（在 x=1.0, y=0, z=0 附近的最近流体节点）
-        # Define Mic node (closest fluid node near x=1.0, y=0, z=0 - may need adjustment)
-        mic_target_pos = torch.tensor([1.0, 0.0, 0.0], device=device)
+        mic_target_pos = np.array([1.0, 0.0, 0.0])
         # 找远端节点（例如，x > 0.8 * length_main）并且是流体节点
-        potential_far_indices = torch.nonzero(self.nodes[:, 0] > 0.8 * length_main).squeeze()
-        far_mask = torch.isin(potential_far_indices, self.fluid_unique_nodes)
-        self.far_fluid_idx = potential_far_indices[far_mask]
+        potential_far_indices = np.nonzero(nodes_np[:, 0] > 0.8 * length_main)[0]
+        far_mask = np.isin(potential_far_indices, fluid_unique_nodes_np)
+        self.far_fluid_idx = jnp.array(potential_far_indices[far_mask])
         
         # 在远端流体节点中找最近的
-        if self.far_fluid_idx.numel() > 0:
-             far_nodes_coords = self.nodes[self.far_fluid_idx]
-             dists_to_mic = torch.norm(far_nodes_coords - mic_target_pos, dim=1)
-             self.mic_node_idx = self.far_fluid_idx[torch.argmin(dists_to_mic)] # 单个节点索引
-             print(f"  麦克风节点索引: {self.mic_node_idx}, 坐标: {self.nodes[self.mic_node_idx]}")
+        if len(self.far_fluid_idx) > 0:
+             far_fluid_idx_np = np.array(self.far_fluid_idx)
+             far_nodes_coords = nodes_np[far_fluid_idx_np]
+             dists_to_mic = np.linalg.norm(far_nodes_coords - mic_target_pos, axis=1)
+             self.mic_node_idx = self.far_fluid_idx[np.argmin(dists_to_mic)] # 单个节点索引
+             print(f"  麦克风节点索引: {self.mic_node_idx}, 坐标: {self.nodes[int(self.mic_node_idx)]}")
         else:
              print("[warning] 未找到适合放置麦克风的远端流体节点.")
              self.mic_node_idx = None # 后续处理
 
         # --- 识别固定边界条件的固体节点 ---
-        solid_node_ids_all = torch.unique(self.solid_elements.flatten())
-        solid_coords_all = self.nodes[solid_node_ids_all]
-        solid_r_yz = torch.linalg.norm(solid_coords_all[:, 1:3], dim=1)
+        solid_node_ids_all = np.unique(np.array(self.solid_elements).flatten())
+        solid_coords_all = nodes_np[solid_node_ids_all]
+        solid_r_yz = np.linalg.norm(solid_coords_all[:, 1:3], axis=1)
         
         outer_radius_tol = 1e-3
         end_plane_tol = 1e-3
         
         # 查找靠近 x=0 和靠近 r=r_outer 的固体节点
-        fixed_solid_mask = (torch.abs(solid_coords_all[:, 0]) < end_plane_tol) & \
-                           (torch.abs(solid_r_yz - r_outer) < outer_radius_tol)
+        fixed_solid_mask = (np.abs(solid_coords_all[:, 0]) < end_plane_tol) & \
+                           (np.abs(solid_r_yz - r_outer) < outer_radius_tol)
         
         fixed_solid_candidates = solid_node_ids_all[fixed_solid_mask]
         # 排除界面节点
-        non_interface_mask = torch.tensor([idx.item() not in interface_nodes_set for idx in fixed_solid_candidates], device=device)
-        self.fixed_solid_nodes_idx = fixed_solid_candidates[non_interface_mask]
-        print(f"[info] 识别固定固体节点: 总共 {fixed_solid_candidates.shape[0]} 个候选节点, 排除 {fixed_solid_candidates.shape[0] - self.fixed_solid_nodes_idx.shape[0]} 个界面节点, 最终 {self.fixed_solid_nodes_idx.shape[0]} 个固定节点")
+        non_interface_mask = np.array([idx not in interface_nodes_set for idx in fixed_solid_candidates])
+        self.fixed_solid_nodes_idx = jnp.array(fixed_solid_candidates[non_interface_mask])
+        print(f"[info] 识别固定固体节点: 总共 {len(fixed_solid_candidates)} 个候选节点, 排除 {len(fixed_solid_candidates) - len(self.fixed_solid_nodes_idx)} 个界面节点, 最终 {len(self.fixed_solid_nodes_idx)} 个固定节点")
         
-        if self.fixed_solid_nodes_idx.shape[0] < 3: # 通常需要至少3个非共线点
+        if len(self.fixed_solid_nodes_idx) < 3: # 通常需要至少3个非共线点
              print("[warning] 固定的固体节点少于3个。刚体模式可能未完全约束.")
 
-        print(f"[info] 初始化完成, fluid elems: {self.fluid_elements.shape[0]}, solid elems: {self.solid_elements.shape[0]}, interface nodes: {self.interface_idx.shape[0]}, inlet nodes: {self.near_fluid_idx.shape[0]}, combined outlet nodes: {self.outlet_fluid_idx.shape[0]}, fixed solid nodes: {self.fixed_solid_nodes_idx.shape[0]}")
+        print(f"[info] 初始化完成, fluid elems: {self.fluid_elements.shape[0]}, solid elems: {self.solid_elements.shape[0]}, interface nodes: {len(self.interface_idx)}, inlet nodes: {len(self.near_fluid_idx)}, combined outlet nodes: {len(self.outlet_fluid_idx)}, fixed solid nodes: {len(self.fixed_solid_nodes_idx)}")
         # self.visualize_elements()
-        # input("[info] 按回车继续...")
+        # input("[info] 按回车继续...") 
 
-    
-    # 在 CoupledFEMSolver.__init__ 的末尾处新增可视化方法
     def visualize_elements(self):
-        # 将节点转换为 CPU 的 numpy 数组
-        nodes_np = self.nodes.detach().cpu().numpy()  # [n_nodes, 3]
+        # 将JAX节点转换为NumPy数组
+        nodes_np = np.array(self.nodes)  # [n_nodes, 3]
+        fluid_elements_np = np.array(self.fluid_elements)
+        solid_elements_np = np.array(self.solid_elements)
+        interface_idx_np = np.array(self.interface_idx)
+        interface_normals_np = np.array(self.interface_normals)
+        near_fluid_idx_np = np.array(self.near_fluid_idx)
+        outlet_fluid_idx_np = np.array(self.outlet_fluid_idx)
+        fixed_solid_nodes_idx_np = np.array(self.fixed_solid_nodes_idx)
 
         # -----------------------------
         # 可视化 Fluid Domain (Tetrahedra)
         # -----------------------------
-        fluid_cells_np = self.fluid_elements.detach().cpu().numpy() # Shape (n_fluid_elements, 4)
-        n_fluid_cells = fluid_cells_np.shape[0]
+        n_fluid_cells = fluid_elements_np.shape[0]
         # VTK cell format requires prepending cell size (4 for tetra)
         padding = np.full((n_fluid_cells, 1), 4, dtype=np.int64)
-        vtk_fluid_cells = np.hstack((padding, fluid_cells_np)).flatten()
+        vtk_fluid_cells = np.hstack((padding, fluid_elements_np)).flatten()
         # Cell types (all tetrahedra)
         vtk_fluid_cell_types = np.full(n_fluid_cells, pv.CellType.TETRA, dtype=np.int32)
 
         fluid_grid = pv.UnstructuredGrid(vtk_fluid_cells, vtk_fluid_cell_types, nodes_np)
 
         # Extract points used by fluid elements for visualization
-        fluid_node_indices = np.unique(fluid_cells_np.flatten()) # Get unique node indices used in fluid elements
+        fluid_node_indices = np.unique(fluid_elements_np.flatten()) # Get unique node indices used in fluid elements
         fluid_points_np = nodes_np[fluid_node_indices]
         fluid_nodes_vis = pv.PolyData(fluid_points_np)
 
         # -----------------------------
         # 可视化 Solid Elements（四面体单元的三角面）
         # -----------------------------
-        solid_cells = self.solid_elements.detach().cpu().numpy()  # 每个单元4个节点
         solid_faces = []
-        for cell in solid_cells:
+        for cell in solid_elements_np:
             pts = cell.tolist()
             faces = [
                 pts[0:3],
@@ -612,8 +645,8 @@ class CoupledFEMSolver(nn.Module):
         # -----------------------------
         # 可视化 Interface
         # -----------------------------
-        interface_nodes = self.nodes[self.interface_idx].detach().cpu().numpy()
-        interface_normals = self.interface_normals.detach().cpu().numpy()  # [n_iface, 3]
+        interface_nodes = nodes_np[interface_idx_np]
+        interface_normals = interface_normals_np  # [n_iface, 3]
 
         # 构造 PyVista 点云
         interface_points = pv.PolyData(interface_nodes)
@@ -621,19 +654,19 @@ class CoupledFEMSolver(nn.Module):
         # -----------------------------
         # 可视化 Inlet Nodes
         # -----------------------------
-        inlet_nodes = self.nodes[self.near_fluid_idx].detach().cpu().numpy()
+        inlet_nodes = nodes_np[near_fluid_idx_np]
         inlet_points = pv.PolyData(inlet_nodes)
 
         # -----------------------------
         # 可视化 Outlet Nodes
         # -----------------------------
-        outlet_nodes = self.nodes[self.outlet_fluid_idx].detach().cpu().numpy()
+        outlet_nodes = nodes_np[outlet_fluid_idx_np]
         outlet_points = pv.PolyData(outlet_nodes)
         
         # -----------------------------
         # 可视化 Fixed Solid Nodes
         # -----------------------------
-        fixed_solid_nodes = self.nodes[self.fixed_solid_nodes_idx].detach().cpu().numpy()
+        fixed_solid_nodes = nodes_np[fixed_solid_nodes_idx_np]
         fixed_solid_points = pv.PolyData(fixed_solid_nodes)
 
         # 生成箭头：利用每个 interface 点及其法向量，设定箭头长度
@@ -662,68 +695,81 @@ class CoupledFEMSolver(nn.Module):
         plotter.show()
     
     def assemble_global_system(self, E, nu, rho_s, inlet_source=1.0, volume_source=None):
-        """ Assemble coupled system using mappings and apply ALL BCs 
+        """ 
+        组装耦合系统，应用所有边界条件
         
         Args:
             E, nu, rho_s: 固体材料参数
-            source_value: 入口边界处声压值
+            inlet_source: 入口边界处声压值
             volume_source: 体激励项，可以是常数或函数f(x,y,z)
         """
-        # Get sizes and mappings from self
+        # 获取各个尺寸和映射
         N_fluid_unique = self.N_fluid_unique
         n_solid_dof = self.n_solid_dof
         fluid_mapping = self.fluid_mapping
         solid_mapping = self.solid_mapping
 
-        # ---- Raw System Assembly ----
+        # ---- 原始系统组装 ----
         print("[info] 正在组装原始流体系统(映射后)...")
-        A_f, F_f = self.assemble_global_fluid_system(volume_source) # Gets raw mapped A_f, F_f
-        # u = torch.linalg.solve(A_f, F_f)
+        A_f, F_f = self.assemble_global_fluid_system(volume_source) # 获取原始映射的 A_f, F_f
         print("[info] 正在组装原始固体系统(映射后)...")
-        A_s, F_s = self.assemble_global_solid_system(E, nu, rho_s) # Gets raw mapped A_s, F_s
-        # u = torch.linalg.solve(A_s, F_s)
+        A_s, F_s = self.assemble_global_solid_system(E, nu, rho_s) # 获取原始映射的 A_s, F_s
+        
         visualize_system(A_f, F_f, N_fluid_unique, n_solid_dof, title_suffix="Raw Fluid System Mapped")
         visualize_system(A_s, F_s, n_solid_dof, N_fluid_unique, title_suffix="Raw Solid System Mapped")
-        # ---- Assemble Coupling Matrices (Using Mappings) ----
+        
+        # ---- 组装耦合矩阵 ----
         print("[info] 正在组装耦合矩阵(映射后)...")
-        C_sf = torch.zeros((n_solid_dof, N_fluid_unique), dtype=torch.float32, device=device)
-        C_fs = torch.zeros((N_fluid_unique, n_solid_dof), dtype=torch.float32, device=device)
+        # 初始化耦合矩阵
+        C_sf = jnp.zeros((n_solid_dof, N_fluid_unique))
+        C_fs = jnp.zeros((N_fluid_unique, n_solid_dof))
 
-        if self.interface_idx.numel() > 0:
-            interface_node_set = set(self.interface_idx.cpu().numpy())
-            # Keep track of interface normals corresponding to self.interface_idx
-            interface_normals_map = {global_idx.item(): normal_vec for global_idx, normal_vec in zip(self.interface_idx, self.interface_normals)}
+        # 由于JAX的特性，这段组装矩阵的代码难以直接转换为函数式风格
+        # 我们使用NumPy辅助处理
+        C_sf_np = np.zeros((n_solid_dof, N_fluid_unique))
+        C_fs_np = np.zeros((N_fluid_unique, n_solid_dof))
+        
+        fluid_elements_np = np.array(self.fluid_elements)
+        nodes_np = np.array(self.nodes)
+        interface_idx_np = np.array(self.interface_idx)
+        interface_normals_np = np.array(self.interface_normals)
+        
+        if len(interface_idx_np) > 0:
+            interface_node_set = set(interface_idx_np)
+            # 创建界面法向量映射字典
+            interface_normals_map = {int(idx): normal for idx, normal in zip(interface_idx_np, interface_normals_np)}
 
-            for elem_nodes in tqdm(self.fluid_elements, desc="Assembling coupling", leave=False):
-                # Check if *any* node of the element is an interface node first (optimization)
-                if not any(node.item() in interface_node_set for node in elem_nodes):
+            for elem_nodes in tqdm(fluid_elements_np, desc="组装耦合矩阵"):
+                # 检查元素是否有界面节点（优化）
+                if not any(node in interface_node_set for node in elem_nodes):
                     continue
 
                 local_faces = [(0, 1, 2), (0, 3, 1), (0, 2, 3), (1, 3, 2)]
-                nodes_coords_elem = self.nodes[elem_nodes]
+                nodes_coords_elem = nodes_np[elem_nodes]
                 for i_face, local_face in enumerate(local_faces):
-                    global_node_indices_face = elem_nodes[torch.tensor(local_face, device=elem_nodes.device)]
-                    # Ensure all nodes of the face are in BOTH fluid and solid mappings AND on interface
+                    global_node_indices_face = elem_nodes[local_face]
+                    # 确保面的所有节点都在流体和固体映射中且是界面节点
                     is_mappable_interface_face = True
                     local_fluid_indices_face = []
-                    local_solid_indices_face = [] # Map solid indices too
+                    local_solid_indices_face = []
 
-                    for node_idx_tensor in global_node_indices_face:
-                        node_idx = node_idx_tensor.item()
-                        if node_idx in interface_node_set and node_idx in fluid_mapping and node_idx in solid_mapping:
+                    for node_idx in global_node_indices_face:
+                        if (node_idx in interface_node_set and 
+                            node_idx in fluid_mapping and 
+                            node_idx in solid_mapping):
                             local_fluid_indices_face.append(fluid_mapping[node_idx])
                             local_solid_indices_face.append(solid_mapping[node_idx])
                         else:
                             is_mappable_interface_face = False
-                            break # Stop checking this face
+                            break  # 停止检查这个面
 
                     if is_mappable_interface_face:
-                        # --- Calculate normal and area (same as before) ---
+                        # --- 计算法向量和面积 ---
                         p0_idx, p1_idx, p2_idx = global_node_indices_face
-                        p0, p1, p2 = self.nodes[p0_idx], self.nodes[p1_idx], self.nodes[p2_idx]
+                        p0, p1, p2 = nodes_np[p0_idx], nodes_np[p1_idx], nodes_np[p2_idx]
                         v1, v2 = p1 - p0, p2 - p0
-                        normal_vec_cross = torch.cross(v1.float(), v2.float())
-                        face_area = torch.norm(normal_vec_cross) / 2.0
+                        normal_vec_cross = np.cross(v1, v2)
+                        face_area = np.linalg.norm(normal_vec_cross) / 2.0
 
                         if face_area > 1e-12:
                             normal_vec = normal_vec_cross / (2.0 * face_area)
@@ -731,32 +777,38 @@ class CoupledFEMSolver(nn.Module):
                             p3 = nodes_coords_elem[local_idx_p3]
                             face_centroid = (p0 + p1 + p2) / 3.0
                             vec_to_p3 = p3 - face_centroid
-                            if torch.dot(normal_vec, vec_to_p3.float()) > 0: normal_vec = -normal_vec
-                            # --- End Normal Calculation ---
+                            if np.dot(normal_vec, vec_to_p3) > 0: 
+                                normal_vec = -normal_vec
+                            # --- 法向量计算结束 ---
 
-                            # Assemble C_sf (Force ON solid is -p*n)
+                            # 组装 C_sf (Force ON solid is -p*n)
                             force_contrib = -(face_area / 3.0) * normal_vec
-                            # Assemble C_fs (Fluid equation term rho*omega^2*u_n)
+                            # 组装 C_fs (Fluid equation term rho*omega^2*u_n)
                             motion_contrib = rho_f * (self.omega**2) * (face_area / 3.0) * normal_vec
 
-                            # Add contributions using LOCAL indices
-                            for i_node_face in range(3): # Iterate 0, 1, 2 for the face nodes
+                            # 使用局部索引添加贡献
+                            for i_node_face in range(3): # 遍历面上的三个节点
                                 fluid_local_idx = local_fluid_indices_face[i_node_face]
-                                solid_local_idx = local_solid_indices_face[i_node_face] # Corresponding local solid index
+                                solid_local_idx = local_solid_indices_face[i_node_face]
 
-                                C_sf[solid_local_idx*3 : solid_local_idx*3+3, fluid_local_idx] += force_contrib.type(C_sf.dtype)
-                                C_fs[fluid_local_idx, solid_local_idx*3 : solid_local_idx*3+3] += motion_contrib.type(C_fs.dtype)
+                                C_sf_np[solid_local_idx*3:(solid_local_idx+1)*3, fluid_local_idx] += force_contrib
+                                C_fs_np[fluid_local_idx, solid_local_idx*3:(solid_local_idx+1)*3] += motion_contrib
         else:
             print("[info] 未找到界面节点，跳过耦合矩阵组装.")
 
-        # visualize_system(C_sf, C_fs, n_solid_dof, N_fluid_unique, title_suffix="Coupling Matrices")
-        if (C_fs==0).all() and (C_sf==0).all():
+        # 转换回JAX数组
+        C_sf = jnp.array(C_sf_np)
+        C_fs = jnp.array(C_fs_np)
+
+        # 检查耦合矩阵是否全零
+        if jnp.all(C_fs == 0) and jnp.all(C_sf == 0):
             print("[warning] 耦合矩阵全为零！")
-        # ---- Construct Global Block Matrix (Mapped) ----
+            
+        # ---- 构造全局矩阵 ----
         print("[info] 正在构造全局块矩阵(映射后)...")
         global_dim = N_fluid_unique + n_solid_dof
 
-        # Check dimensions before creating A_global
+        # 检查维度匹配
         if A_f.shape != (N_fluid_unique, N_fluid_unique):
             print(f"[Error] A_f形状不匹配！预期({N_fluid_unique},{N_fluid_unique})，实际得到{A_f.shape}")
             raise ValueError("A_f维度不匹配")
@@ -764,97 +816,105 @@ class CoupledFEMSolver(nn.Module):
             print(f"[Error] A_s形状不匹配！预期({n_solid_dof},{n_solid_dof})，实际得到{A_s.shape}")
             raise ValueError("A_s维度不匹配")
         if C_fs.shape != (N_fluid_unique, n_solid_dof):
-             print(f"[Error] C_fs形状不匹配！预期({N_fluid_unique},{n_solid_dof})，实际得到{C_fs.shape}")
-             # Attempt resize (risky) or raise error
-             # C_fs = C_fs.resize_(N_fluid_unique, n_solid_dof)
-             raise ValueError("C_fs维度不匹配")
+            print(f"[Error] C_fs形状不匹配！预期({N_fluid_unique},{n_solid_dof})，实际得到{C_fs.shape}")
+            raise ValueError("C_fs维度不匹配")
         if C_sf.shape != (n_solid_dof, N_fluid_unique):
-             print(f"[Error] C_sf形状不匹配！预期({n_solid_dof},{N_fluid_unique})，实际得到{C_sf.shape}")
-             # C_sf = C_sf.resize_(n_solid_dof, N_fluid_unique)
-             raise ValueError("C_sf维度不匹配")
+            print(f"[Error] C_sf形状不匹配！预期({n_solid_dof},{N_fluid_unique})，实际得到{C_sf.shape}")
+            raise ValueError("C_sf维度不匹配")
 
-        A_global = torch.zeros((global_dim, global_dim), dtype=torch.float32, device=device)
-        A_global[0:N_fluid_unique, 0:N_fluid_unique] = A_f
-        A_global[0:N_fluid_unique, N_fluid_unique:] = C_fs
-        A_global[N_fluid_unique:, 0:N_fluid_unique] = C_sf
-        A_global[N_fluid_unique:, N_fluid_unique:] = A_s
+        # 构造全局系统矩阵（JAX中，我们可以使用block_matrix函数）
+        A_global = jnp.zeros((global_dim, global_dim))
+        # 填充四个块
+        A_global = A_global.at[:N_fluid_unique, :N_fluid_unique].set(A_f)
+        A_global = A_global.at[:N_fluid_unique, N_fluid_unique:].set(C_fs)
+        A_global = A_global.at[N_fluid_unique:, :N_fluid_unique].set(C_sf)
+        A_global = A_global.at[N_fluid_unique:, N_fluid_unique:].set(A_s)
 
-
-        # ---- Construct Global Force Vector (Mapped) ----
-        if F_f.shape[0] != N_fluid_unique: F_f = F_f.resize_(N_fluid_unique) # Risky
-        if F_s.shape[0] != n_solid_dof: F_s = F_s.resize_(n_solid_dof)     # Risky
-        F_global = torch.cat((F_f, F_s), dim=0)
+        # ---- 构造全局载荷向量 ----
+        # 确保F_f和F_s维度正确
+        if F_f.shape[0] != N_fluid_unique:
+            F_f = F_f.reshape(N_fluid_unique)
+        if F_s.shape[0] != n_solid_dof:
+            F_s = F_s.reshape(n_solid_dof)
+        
+        F_global = jnp.concatenate((F_f, F_s))
         print(f"[debug] 原始映射后的A_global形状: {A_global.shape}, 原始映射后的F_global形状: {F_global.shape}")
 
-        # <-- Call visualization BEFORE applying BCs -->
+        # 在应用边界条件前可视化
         visualize_system(A_global, F_global, N_fluid_unique, n_solid_dof, title_suffix="Raw Assembly Mapped")
 
-        # ---- Apply ALL Dirichlet Boundary Conditions to Mapped A_global, F_global ----
+        # ---- 应用所有边界条件 ----
         print("[info] 正在应用边界条件(映射后)...")
         penalty = self.bcpenalty
-
-        # Apply Fluid Inlet BC (p = source_value) - Dirichlet condition
-        print(f"[debug] 正在应用流体入口边界条件(p={inlet_source})到{self.near_fluid_idx.shape[0]}个全局节点...")
+        
+        # 由于JAX的不可变性质，我们需要使用NumPy处理边界条件应用
+        A_global_np = np.array(A_global)
+        F_global_np = np.array(F_global)
+        
+        # 应用流体入口边界条件 (p = source_value)
+        print(f"[debug] 正在应用流体入口边界条件(p={inlet_source})到{len(self.near_fluid_idx)}个全局节点...")
         nodes_processed_by_inlet = set()
-        for global_idx_tensor in self.near_fluid_idx:
-             global_idx = global_idx_tensor.item()
-             if global_idx in fluid_mapping: # Ensure it's a fluid node
-                 local_idx = fluid_mapping[global_idx] # Get local fluid index
-                 if local_idx not in nodes_processed_by_inlet:
-                     A_global[local_idx, :] = 0.0
-                     A_global[:, local_idx] = 0.0
-                     A_global[local_idx, local_idx] = penalty
-                     F_global[local_idx] = penalty * inlet_source
-                     nodes_processed_by_inlet.add(local_idx)
-             else:
-                 print(f"[warning] 入口节点{global_idx}在fluid_mapping中未找到.")
+        
+        for global_idx in np.array(self.near_fluid_idx):
+            global_idx_int = int(global_idx)
+            if global_idx_int in fluid_mapping:  # 确保是流体节点
+                local_idx = fluid_mapping[global_idx_int]  # 获取局部流体索引
+                if local_idx not in nodes_processed_by_inlet:
+                    A_global_np[local_idx, :] = 0.0
+                    A_global_np[:, local_idx] = 0.0
+                    A_global_np[local_idx, local_idx] = penalty
+                    F_global_np[local_idx] = penalty * inlet_source
+                    nodes_processed_by_inlet.add(local_idx)
+            else:
+                print(f"[warning] 入口节点{global_idx_int}在fluid_mapping中未找到.")
 
-        # Apply Fluid Outlet BC (dp/dn = 0) - Neumann condition (non-reflecting)
-        # For Neumann boundary condition, we don't need to modify the system matrix
-        # The natural boundary condition dp/dn = 0 is automatically satisfied
-        # Just need to report that we're using this type of boundary
-        print(f"[info] 在出口处使用诺依曼边界条件(dp/dn=0)({self.outlet_fluid_idx.shape[0]}个节点)")
+        # 应用流体出口边界条件 (dp/dn = 0) - 诺依曼边界条件
+        print(f"[info] 在出口处使用诺依曼边界条件(dp/dn=0)({len(self.outlet_fluid_idx)}个节点)")
         print(f"[info] 这是一个无反射出口边界条件")
         
-        # Verify that outlet nodes are in the fluid domain
+        # 验证出口节点在流体域中
         valid_outlet_count = 0
-        for global_idx_tensor in self.outlet_fluid_idx:
-            global_idx = global_idx_tensor.item()
-            if global_idx in fluid_mapping:
+        for global_idx in np.array(self.outlet_fluid_idx):
+            global_idx_int = int(global_idx)
+            if global_idx_int in fluid_mapping:
                 valid_outlet_count += 1
             else:
-                print(f"[warning] 出口节点{global_idx}在fluid_mapping中未找到.")
+                print(f"[warning] 出口节点{global_idx_int}在fluid_mapping中未找到.")
         print(f"[info] 找到{valid_outlet_count}个用于诺依曼边界条件的有效出口节点")
 
-        # Apply Solid Fixed BCs (u = 0)
-        print(f"[debug] 正在应用固定固体边界条件到{self.fixed_solid_nodes_idx.shape[0]}个全局节点...")
+        # 应用固体固定边界条件 (u = 0)
+        print(f"[debug] 正在应用固定固体边界条件到{len(self.fixed_solid_nodes_idx)}个全局节点...")
         processed_solid_global_dofs = set()
-        for global_node_idx_tensor in self.fixed_solid_nodes_idx:
-            global_node_idx = global_node_idx_tensor.item()
-            if global_node_idx in solid_mapping:
-                 solid_local_idx = solid_mapping[global_node_idx]
-                 # Calculate global DOF indices with N_fluid_unique offset
-                 global_dof_indices = [N_fluid_unique + solid_local_idx*3 + i for i in range(3)]
+        
+        for global_node_idx in np.array(self.fixed_solid_nodes_idx):
+            global_node_idx_int = int(global_node_idx)
+            if global_node_idx_int in solid_mapping:
+                solid_local_idx = solid_mapping[global_node_idx_int]
+                # 计算全局自由度索引（考虑N_fluid_unique偏移）
+                global_dof_indices = [N_fluid_unique + solid_local_idx*3 + i for i in range(3)]
 
-                 for dof_idx in global_dof_indices:
-                      if dof_idx < global_dim:
-                           if dof_idx not in processed_solid_global_dofs and A_global[dof_idx, dof_idx] != penalty:
-                                A_global[dof_idx, :] = 0.0
-                                A_global[:, dof_idx] = 0.0
-                                A_global[dof_idx, dof_idx] = penalty
-                                F_global[dof_idx] = 0.0
-                                processed_solid_global_dofs.add(dof_idx)
-                      else:
-                           print(f"[warning] 计算得到的固体自由度索引{dof_idx}超出边界({global_dim}).")
+                for dof_idx in global_dof_indices:
+                    if dof_idx < global_dim:
+                        if dof_idx not in processed_solid_global_dofs and A_global_np[dof_idx, dof_idx] != penalty:
+                            A_global_np[dof_idx, :] = 0.0
+                            A_global_np[:, dof_idx] = 0.0
+                            A_global_np[dof_idx, dof_idx] = penalty
+                            F_global_np[dof_idx] = 0.0
+                            processed_solid_global_dofs.add(dof_idx)
+                    else:
+                        print(f"[warning] 计算得到的固体自由度索引{dof_idx}超出边界({global_dim}).")
             else:
-                 print(f"[warning] 固定的固体节点{global_node_idx}在solid_mapping中未找到.")
+                print(f"[warning] 固定的固体节点{global_node_idx_int}在solid_mapping中未找到.")
 
+        # 将修改后的矩阵和向量转回JAX数组
+        A_global = jnp.array(A_global_np)
+        F_global = jnp.array(F_global_np)
 
         print("[info] 全局矩阵与边界条件组装完成.")
-        # <-- Optionally visualize AFTER applying BCs -->
+        # 应用边界条件后可视化
         visualize_system(A_global, F_global, N_fluid_unique, n_solid_dof, title_suffix="With BCs Mapped")
 
-        return A_global, F_global, N_fluid_unique, n_solid_dof # Return correct sizes
+        return A_global, F_global, N_fluid_unique, n_solid_dof
 
     def solve(self, E, nu, rho_s, volume_source=None):
         """
@@ -865,77 +925,87 @@ class CoupledFEMSolver(nn.Module):
         Args:
             E, nu, rho_s: 固体材料参数
             volume_source: 体激励项，可以是常数或函数f(x,y,z)
-                           例如：constant_source = 10.0
-                           或者：def spatial_source(x, y, z): return 10.0 * np.exp(-(x**2 + y**2 + z**2))
-                           
-        Examples:
-            # 使用常数体激励项
-            solver.solve(E=1e9, nu=0.3, rho_s=1000.0, volume_source=10.0)
-            
-            # 使用空间变化的体激励项
-            def gaussian_source(x, y, z):
-                # 高斯分布的声源，在(0.5, 0, 0)位置最强
-                return 10.0 * torch.exp(-5*((x-0.5)**2 + y**2 + z**2))
-            
-            solver.solve(E=1e9, nu=0.3, rho_s=1000.0, volume_source=gaussian_source)
         """
-        A_global, F_global, N_fluid_unique, n_solid_dof_actual = self.assemble_global_system(E, nu, rho_s, inlet_source=0.0, volume_source=volume_source)
+        A_global, F_global, N_fluid_unique, n_solid_dof_actual = self.assemble_global_system(
+            E, nu, rho_s, inlet_source=0.0, volume_source=volume_source
+        )
+        
         print("[info] 开始求解 (mapped system)")
         try:
-            u = torch.linalg.lstsq(A_global, F_global).solution
-        except torch._C._LinAlgError as e:
+            # 使用JAX的线性代数求解器
+            u = jnp.linalg.solve(A_global, F_global)
+        except Exception as e:
             print(f"求解器错误: {e}")
             print("矩阵可能仍然是奇异的或条件数不佳.")
-            torch.save(A_global, 'A_global_error.pt')
-            torch.save(F_global, 'F_global_error.pt')
+            # 保存矩阵为NumPy格式
+            np.save('A_global_error.npy', np.array(A_global))
+            np.save('F_global_error.npy', np.array(F_global))
             raise
+            
         print("[info] 求解完成")
-        print(f"[info] topk: {torch.topk(u, 100)}")
-        # Extract microphone pressure using fluid_mapping
-        p_mic = torch.tensor(0.0, device=device, dtype=u.dtype) # Default value
+        # 提取前k个最大值进行打印
+        topk_indices = jnp.argsort(-jnp.abs(u))[:100]
+        topk_values = u[topk_indices]
+        print(f"[info] 解向量前100大值: {topk_values}")
+        
+        # 提取麦克风处的压力
+        p_mic = jnp.array(0.0)  # 默认值
+        
         if self.mic_node_idx is not None:
-             global_mic_idx = self.mic_node_idx.item()
-             if global_mic_idx in self.fluid_mapping:
-                  local_mic_idx = self.fluid_mapping[global_mic_idx]
-                  if local_mic_idx < N_fluid_unique: # Double check bounds
-                       p_mic = u[local_mic_idx]
-                  else:
-                       print(f"[warning] 映射后的麦克风索引{local_mic_idx}超出流体自由度范围({N_fluid_unique}).")
-             else:
-                  print(f"[warning] 全局麦克风节点索引{global_mic_idx}在fluid_mapping中未找到.")
+            global_mic_idx = int(self.mic_node_idx)
+            if global_mic_idx in self.fluid_mapping:
+                local_mic_idx = self.fluid_mapping[global_mic_idx]
+                if local_mic_idx < N_fluid_unique:  # 检查索引边界
+                    p_mic = u[local_mic_idx]
+                else:
+                    print(f"[warning] 映射后的麦克风索引{local_mic_idx}超出流体自由度范围({N_fluid_unique}).")
+            else:
+                print(f"[warning] 全局麦克风节点索引{global_mic_idx}在fluid_mapping中未找到.")
         else:
-             print("[warning] 麦克风节点索引未定义.")
-        print(f"[info] 预测远端麦克风处流体声压: {p_mic.squeeze()}")
-        return p_mic.squeeze(), u # Return scalar p_mic
+            print("[warning] 麦克风节点索引未定义.")
+            
+        print(f"[info] 预测远端麦克风处流体声压: {p_mic}")
+        return p_mic, u  # 返回麦克风压力标量和全局解向量
 
     def assemble_global_fluid_system(self, source_value=None):
-        """ Assemble raw fluid system A_f, F_f (Helmholtz) using local fluid mapping 
+        """ 
+        组装原始流体系统 A_f, F_f (Helmholtz方程)，使用局部流体映射
         
         Args:
             source_value: 体激励项，可以是常数或者函数f(x,y,z)
         """
-        # Use pre-calculated sizes and mapping
-        n_fluid_local_dof = self.N_fluid_unique # Size based on unique fluid nodes
+        # 使用预计算的尺寸和映射
+        n_fluid_local_dof = self.N_fluid_unique  # 基于唯一流体节点的尺寸
         fluid_mapping = self.fluid_mapping
 
-        K_f = torch.zeros((n_fluid_local_dof, n_fluid_local_dof), dtype=torch.float32, device=device)
-        M_f = torch.zeros((n_fluid_local_dof, n_fluid_local_dof), dtype=torch.float32, device=device)
-        F_f = torch.zeros(n_fluid_local_dof, dtype=torch.float32, device=device)
+        # 由于JAX的函数式风格，矩阵组装使用NumPy辅助完成
+        K_f_np = np.zeros((n_fluid_local_dof, n_fluid_local_dof))
+        M_f_np = np.zeros((n_fluid_local_dof, n_fluid_local_dof))
+        F_f_np = np.zeros(n_fluid_local_dof)
+
+        # 获取NumPy版本的节点和元素
+        nodes_np = np.array(self.nodes)
+        fluid_elements_np = np.array(self.fluid_elements)
 
         print("[debug] 正在组装流体K_f和M_f(原始的，映射后)...")
-        for elem in tqdm(self.fluid_elements, desc="组装流体K/M", leave=False):
-            coords = self.nodes[elem]
-            K_e, M_e = element_matrices_fluid(coords)
-            # Map global element indices to local fluid indices
-            local_indices = [fluid_mapping[glob_idx.item()] for glob_idx in elem]
+        for elem in tqdm(fluid_elements_np, desc="组装流体K/M"):
+            coords = nodes_np[elem]
+            # 使用JAX计算局部矩阵
+            K_e, M_e = element_matrices_fluid(jnp.array(coords))
+            # 转换为NumPy用于组装
+            K_e_np = np.array(K_e)
+            M_e_np = np.array(M_e)
+            
+            # 将全局元素索引映射到局部流体索引
+            local_indices = [fluid_mapping[int(glob_idx)] for glob_idx in elem]
 
-            # Scatter using local indices
-            for r_local_map in range(4): # Index within local_indices (0-3)
-                 row_idx = local_indices[r_local_map]
-                 for c_local_map in range(4):
-                      col_idx = local_indices[c_local_map]
-                      K_f[row_idx, col_idx] += K_e[r_local_map, c_local_map]
-                      M_f[row_idx, col_idx] += M_e[r_local_map, c_local_map]
+            # 使用局部索引分散组装
+            for r_local_map in range(4):  # 局部索引0-3
+                row_idx = local_indices[r_local_map]
+                for c_local_map in range(4):
+                    col_idx = local_indices[c_local_map]
+                    K_f_np[row_idx, col_idx] += K_e_np[r_local_map, c_local_map]
+                    M_f_np[row_idx, col_idx] += M_e_np[r_local_map, c_local_map]
             
             # 如果提供了体激励项，计算体积并更新F_f
             if source_value is not None:
@@ -943,10 +1013,10 @@ class CoupledFEMSolver(nn.Module):
                 v1 = coords[1] - coords[0]
                 v2 = coords[2] - coords[0]
                 v3 = coords[3] - coords[0]
-                tetra_vol = torch.abs(torch.dot(torch.cross(v1, v2), v3)) / 6.0
+                tetra_vol = np.abs(np.dot(np.cross(v1, v2), v3)) / 6.0
                 
                 # 计算四面体中心点
-                centroid = torch.mean(coords, dim=0)
+                centroid = np.mean(coords, axis=0)
                 
                 # 确定体激励项的值
                 if callable(source_value):
@@ -959,54 +1029,73 @@ class CoupledFEMSolver(nn.Module):
                 # 计算并应用到载荷向量
                 for r_local_map in range(4):
                     row_idx = local_indices[r_local_map]
-                    F_f[row_idx] += tetra_vol * src_val / 4.0  # 平均分配到四个节点
+                    F_f_np[row_idx] += tetra_vol * src_val / 4.0  # 平均分配到四个节点
 
+        # 计算A_f
         k_sq = (self.omega / self.c_f)**2
+        
+        # 转换回JAX数组
+        K_f = jnp.array(K_f_np)
+        M_f = jnp.array(M_f_np)
+        F_f = jnp.array(F_f_np)
+        
         A_f = K_f - k_sq * M_f
         print("[debug] 原始流体系统组装完成.")
         return A_f, F_f
 
     def assemble_global_solid_system(self, E, nu, rho_s):
-        """ Assemble raw solid system A_s, F_s using local solid mapping """
-        # Use pre-calculated sizes and mapping
+        """ 组装原始固体系统 A_s, F_s，使用局部固体映射 """
+        # 使用预计算的尺寸和映射
         n_solid_dof = self.n_solid_dof
         solid_mapping = self.solid_mapping
 
-        # No need to calculate mapping here anymore
-        # solid_unique_nodes = torch.unique(self.solid_elements.flatten())
-        # solid_mapping = {node_id.item(): i for i, node_id in enumerate(solid_unique_nodes)}
-        # n_solid_nodes_unique = len(solid_unique_nodes)
-        # n_solid_dof = n_solid_nodes_unique * 3
+        # 使用NumPy辅助组装
+        K_s_np = np.zeros((n_solid_dof, n_solid_dof))
+        M_s_np = np.zeros((n_solid_dof, n_solid_dof))
+        F_s_np = np.zeros(n_solid_dof)
 
-        K_s = torch.zeros((n_solid_dof, n_solid_dof), dtype=torch.float32, device=device)
-        M_s = torch.zeros((n_solid_dof, n_solid_dof), dtype=torch.float32, device=device)
-        F_s = torch.zeros(n_solid_dof, dtype=torch.float32, device=device)
+        # 获取NumPy版本的节点和元素
+        nodes_np = np.array(self.nodes)
+        solid_elements_np = np.array(self.solid_elements)
 
         print("[debug] 正在组装固体K_s和M_s(原始的，映射后)...")
-        for elem in tqdm(self.solid_elements, desc="组装固体K/M", leave=False):
-            coords = self.nodes[elem]
-            K_e, M_e = element_matrices_solid(coords, E, nu, rho_s)
-            # Map global element indices to local solid indices
-            local_solid_indices = [solid_mapping[glob_idx.item()] for glob_idx in elem if glob_idx.item() in solid_mapping]
-            # This assumes all nodes in a solid element are unique solid nodes, should be true
+        for elem in tqdm(solid_elements_np, desc="组装固体K/M"):
+            coords = nodes_np[elem]
+            # 使用JAX计算局部矩阵
+            K_e, M_e = element_matrices_solid(jnp.array(coords), E, nu, rho_s)
+            # 转换为NumPy用于组装
+            K_e_np = np.array(K_e)
+            M_e_np = np.array(M_e)
+            
+            # 将全局元素索引映射到局部固体索引
+            try:
+                local_solid_indices = [solid_mapping[int(glob_idx)] for glob_idx in elem]
+            except KeyError:
+                print(f"[Warning] 固体单元{elem}中有节点不在solid_mapping中?")
+                continue
+            
+            # 检查所有节点是否映射成功
             if len(local_solid_indices) != 4:
-                 print(f"[Warning] 固体单元{elem}中有节点不在solid_mapping中?")
-                 continue
+                print(f"[Warning] 固体单元{elem}中有节点不在solid_mapping中?")
+                continue
 
-            for r_local_map in range(4): # Index referring to element's node (0-3)
-                 solid_idx_r = local_solid_indices[r_local_map] # Local solid index
-                 for c_local_map in range(4):
-                      solid_idx_c = local_solid_indices[c_local_map]
-                      # Get the 3x3 block from K_e and M_e based on the element's node order
-                      K_block = K_e[r_local_map*3 : (r_local_map+1)*3, c_local_map*3 : (c_local_map+1)*3]
-                      M_block = M_e[r_local_map*3 : (r_local_map+1)*3, c_local_map*3 : (c_local_map+1)*3]
-                      # Add to the global solid matrices at the mapped indices
-                      K_s[solid_idx_r*3 : (solid_idx_r+1)*3, solid_idx_c*3 : (solid_idx_c+1)*3] += K_block
-                      M_s[solid_idx_r*3 : (solid_idx_r+1)*3, solid_idx_c*3 : (solid_idx_c+1)*3] += M_block
+            for r_local_map in range(4):  # 索引0-3，表示元素节点
+                solid_idx_r = local_solid_indices[r_local_map]  # 局部固体索引
+                for c_local_map in range(4):
+                    solid_idx_c = local_solid_indices[c_local_map]
+                    # 从K_e和M_e获取3x3块，基于元素节点顺序
+                    K_block = K_e_np[r_local_map*3:(r_local_map+1)*3, c_local_map*3:(c_local_map+1)*3]
+                    M_block = M_e_np[r_local_map*3:(r_local_map+1)*3, c_local_map*3:(c_local_map+1)*3]
+                    # 添加到全局固体矩阵，使用映射索引
+                    K_s_np[solid_idx_r*3:(solid_idx_r+1)*3, solid_idx_c*3:(solid_idx_c+1)*3] += K_block
+                    M_s_np[solid_idx_r*3:(solid_idx_r+1)*3, solid_idx_c*3:(solid_idx_c+1)*3] += M_block
 
-        # Calculate A_s = K_s - omega^2 * M_s
+        # 计算A_s = K_s - omega^2 * M_s
+        # 转换回JAX数组
+        K_s = jnp.array(K_s_np)
+        M_s = jnp.array(M_s_np)
+        F_s = jnp.array(F_s_np)
+        
         A_s = K_s - (self.omega**2) * M_s
         print("[debug] 原始固体系统组装完成.")
-        # Return only A_s, F_s (mapping is now in self)
-        return A_s, F_s
-
+        return A_s, F_s 

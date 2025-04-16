@@ -33,9 +33,9 @@ volume_source = args.volume_source    # 施加均匀的体激励项到整个计�
 def spatial_source(x, y, z):
     # 这里可以定义任意空间分布的激励函数
     # 如果z<0.1, 激励为1Pa, 否则为0Pa
-    return 1.0 if z < 0.05 else 0.0
+    return volume_source if z < 0.01 else 0.0
 
-print(f"[info] 使用恒定体激励项: {volume_source} Pa")
+print(f"[info] 使用空间变化的体激励项: {volume_source} Pa")
 
 # -------------------------------
 # 初始化 FEM 求解器

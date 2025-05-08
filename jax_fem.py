@@ -59,13 +59,13 @@ def element_matrices_fluid(coords):
     计算流体四面体单元的局部刚度和质量矩阵。
     使用公式：
       K_e = Volume * (grad(N) @ grad(N)^T)
-      M_e = Volume/20 * (I + ones(4,4))
+      M_e = Volume/10 * (2*I + ones(4,4))
     """
     V = compute_tetra_volume(coords)
     grads = compute_shape_function_gradients(coords)  # [4,3]
     K_e = V * (grads @ jnp.transpose(grads))
     ones_4 = jnp.ones((4,4), dtype=coords.dtype)
-    M_e = V / 20.0 * (jnp.eye(4, dtype=coords.dtype) + ones_4)
+    M_e = V / 10.0 * (jnp.eye(4, dtype=coords.dtype) * 2 + ones_4)
     return K_e, M_e
 
 @jit
@@ -73,7 +73,7 @@ def elasticity_D_matrix(E, nu):
     """
     3D各向同性弹性材料 D 矩阵 (6x6)，Voigt 表示。
     """
-    coeff = jnp.exp(10*E) / ((1 + nu) * (1 - 2 * nu))
+    coeff = jnp.exp(20*E) / ((1 + nu) * (1 - 2 * nu))
     D = coeff * jnp.array([
         [1 - nu,    nu,    nu,       0,       0,       0],
         [nu,    1 - nu,    nu,       0,       0,       0],
@@ -129,7 +129,7 @@ def element_matrices_solid(coords, E, nu, rho_s):
     
     # 质量矩阵采用对角 lumped mass:
     # In JAX we need to construct this differently since we can't do in-place updates
-    m_lump = jnp.exp(rho_s) * V / 4.0
+    m_lump = jnp.exp(6 * rho_s) * V / 4.0
     diag_blocks = []
     for i in range(4):
         diag_blocks.append((i*3, i*3+3, m_lump * jnp.eye(3, dtype=coords.dtype)))
@@ -514,6 +514,7 @@ class CoupledFEMSolver:
         non_interface_mask = np.array([idx not in interface_nodes_set for idx in near_fluid_candidates])
         self.near_fluid_idx = jnp.array(near_fluid_candidates[non_interface_mask], dtype=jnp.int32)
         print(f"[info] 识别入口节点: 总共 {near_fluid_candidates.shape[0]} 个候选节点, 排除 {near_fluid_candidates.shape[0] - len(non_interface_mask[non_interface_mask])} 个界面节点, 最终 {self.near_fluid_idx.shape[0]} 个入口节点")
+        self.near_fluid_idx = jnp.array([], dtype=jnp.int32) # TODO: 暂时关闭入口节点
 
         # 设置主管道出口条件（x ≈ length_main）- 确保它们是流体节点，但不是界面节点
         # Main Outlet (x approx length_main) - Ensure they are fluid nodes but not interface nodes
@@ -561,9 +562,10 @@ class CoupledFEMSolver:
 
         # 定义麦克风节点（在 x=1.0, y=0, z=0 附近的最近流体节点）
         # Define Mic node (closest fluid node near x=1.0, y=0, z=0 - may need adjustment)
-        mic_target_pos = np.array([1.0, 0.0, 0.0])
+        mic_target_pos = np.array([1.0, 0, 0])
+        self.mic_target_pos = mic_target_pos
         # 找远端节点（例如，x > 0.8 * length_main）并且是流体节点
-        potential_far_indices = np.nonzero(nodes_np[:, 0] > 0.8 * length_main)[0]
+        potential_far_indices = np.nonzero((np.abs(nodes_np[:, 1]) < 1e-2) & (np.abs(nodes_np[:, 2]) < 1e-2))[0]
         far_mask = np.isin(potential_far_indices, fluid_unique_nodes_np)
         far_fluid_idx_np = potential_far_indices[far_mask]
         self.far_fluid_idx = jnp.array(far_fluid_idx_np, dtype=jnp.int32)
@@ -595,17 +597,20 @@ class CoupledFEMSolver:
         non_interface_mask = np.array([idx not in interface_nodes_set for idx in fixed_solid_candidates])
         self.fixed_solid_nodes_idx = jnp.array(fixed_solid_candidates[non_interface_mask], dtype=jnp.int32)
         print(f"[info] 识别固定固体节点: 总共 {fixed_solid_candidates.shape[0]} 个候选节点, 排除 {fixed_solid_candidates.shape[0] - len(non_interface_mask[non_interface_mask])} 个界面节点, 最终 {self.fixed_solid_nodes_idx.shape[0]} 个固定节点")
-        
+        self.fixed_solid_nodes_idx = jnp.array([], dtype=jnp.int32) # TODO: 暂时关闭固定节点
         if self.fixed_solid_nodes_idx.shape[0] < 3: # 通常需要至少3个非共线点
              print("[warning] 固定的固体节点少于3个。刚体模式可能未完全约束.")
 
         print(f"[info] 初始化完成, fluid elems: {self.fluid_elements.shape[0]}, solid elems: {self.solid_elements.shape[0]}, interface nodes: {self.interface_idx.shape[0]}, inlet nodes: {self.near_fluid_idx.shape[0]}, combined outlet nodes: {self.outlet_fluid_idx.shape[0]}, fixed solid nodes: {self.fixed_solid_nodes_idx.shape[0]}")
+        self.visualize_elements()
+        input("Press Enter to continue...")
 
     def visualize_elements(self):
         """Visualize the mesh elements, boundary conditions, and interfaces using PyVista."""
+        pv.global_theme.allow_empty_mesh = True
         # 将节点转换为 CPU 的 numpy 数组
         nodes_np = np.array(self.nodes)  # [n_nodes, 3]
-
+        
         # -----------------------------
         # 可视化 Fluid Domain (Tetrahedra)
         # -----------------------------
@@ -673,6 +678,15 @@ class CoupledFEMSolver:
         fixed_solid_nodes = nodes_np[np.array(self.fixed_solid_nodes_idx)]
         fixed_solid_points = pv.PolyData(fixed_solid_nodes)
 
+        # -----------------------------
+        # 可视化 Microphone Node
+        # -----------------------------
+        mic_node = nodes_np[np.array(self.mic_node_idx)]
+        mic_points = pv.PolyData(mic_node)
+
+        # -----------------------------
+        # 可视化 Interface Normals
+        # -----------------------------
         # 生成箭头：利用每个 interface 点及其法向量，设定箭头长度
         arrows = []
         arrow_length = 0.01  # 可根据需要调整
@@ -686,7 +700,7 @@ class CoupledFEMSolver:
         # -----------------------------
         plotter = pv.Plotter()
         # Add the UnstructuredGrid for the fluid domain
-        plotter.add_mesh(fluid_grid, color="cyan", opacity=0.8, show_edges=True, label="Fluid Domain (Tetrahedra)")
+        # plotter.add_mesh(fluid_grid, color="cyan", opacity=0.8, show_edges=True, label="Fluid Domain (Tetrahedra)")
         # Add the nodes belonging to the fluid domain
         plotter.add_mesh(fluid_nodes_vis, color="darkblue", point_size=3, render_points_as_spheres=True, label="Fluid Nodes")
         plotter.add_mesh(solid_mesh, color="grey", opacity=0.8, label="Solid Elements")
@@ -694,8 +708,11 @@ class CoupledFEMSolver:
         plotter.add_mesh(inlet_points, color="yellow", point_size=10, render_points_as_spheres=True, label="Inlet Nodes")
         plotter.add_mesh(outlet_points, color="magenta", point_size=10, render_points_as_spheres=True, label="Outlet Nodes")
         plotter.add_mesh(fixed_solid_points, color="purple", point_size=10, render_points_as_spheres=True, label="Fixed Solid Nodes")
+        plotter.add_mesh(mic_points, color="brown", point_size=20, render_points_as_spheres=True, label="Microphone Node")
+        
         plotter.add_mesh(arrows, color="green", label="Interface Normals")
         plotter.add_legend()
+        plotter.show_grid()  # Add this line to show grid and axis labels
         plotter.show()
 
     def assemble_global_fluid_system(self, source_value=None):
@@ -1259,5 +1276,5 @@ class CoupledFEMSolver:
         else:
             print("[warning] 麦克风节点索引未定义.")
             
-        print(f"[info] 预测远端麦克风处流体声压: {p_mic.squeeze()}")
+        # print(f"[info] 预测远端麦克风处流体声压: {p_mic.squeeze()}")
         return p_mic.squeeze(), u  # Return scalar p_mic

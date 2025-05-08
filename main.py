@@ -4,6 +4,7 @@ import torch.optim as optim
 import numpy as np
 import argparse
 from fem import CoupledFEMSolver
+from torchviz import make_dot
 
 # 添加命令行参数解析
 parser = argparse.ArgumentParser(description='流固耦合FEM求解器')
@@ -90,6 +91,23 @@ for epoch in range(n_epochs):
     pred_pressure, _ = fem_solver.solve(E_param, nu_param, rho_param, volume_source=spatial_source)
     loss = (pred_pressure - target_pressure)**2
     print(f"[info] 预测压力: {pred_pressure.item():.6e}, 目标压力: {target_pressure.item():.6e}, 损失: {loss.item():.6e}")
+    # add backward computation graph visualization
+    if epoch == 0:
+        # set max recursion depth in python
+        import sys
+        sys.setrecursionlimit(100000)
+        # Visualize the computation graph for the first epoch
+        graph_params = {
+            'E_param': E_param,
+            'nu_param': nu_param,
+            'rho_param': rho_param
+        }
+        # Pass parameters that require gradients to make_dot
+        # We are interested in how loss flows back to these parameters
+        dot = make_dot(loss, params=graph_params)
+        dot.render("computation_graph", format="png") # Saves computation_graph.png
+        print("[info] Computation graph saved to computation_graph.png")
+    input("Press Enter to continue...")
     loss.backward()
     optimizer.step()
     # 保证泊松比在 (0, 0.5) 内

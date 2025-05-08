@@ -5,15 +5,17 @@ import optax
 import numpy as np
 import argparse
 from jax_fem import CoupledFEMSolver
+import matplotlib.pyplot as plt
+import os
 
 # 添加命令行参数解析
 parser = argparse.ArgumentParser(description='流固耦合FEM求解器 (JAX版本)')
 parser.add_argument('--mode', type=str, default='optimize', 
                     choices=['optimize', 'single_run'],
                     help='运行模式: optimize进行优化, single_run只运行一次')
-parser.add_argument('--volume_source', type=float, default=1,
+parser.add_argument('--volume_source', type=float, default=1000,
                     help='体激励项强度 (Pa)')
-parser.add_argument('--target_pressure', type=float, default=0.5,
+parser.add_argument('--target_pressure', type=float, default=6.4,
                     help='目标声压 (Pa)')
 args = parser.parse_args()
 
@@ -24,7 +26,7 @@ print(f"Running on device: {device}")
 # -------------------------------
 # 设定基本参数
 # -------------------------------
-frequency = 10.0       # 噪音源频率 (Hz)
+frequency = 100.0       # 噪音源频率 (Hz)
 penalty = 1e8          # 耦合惩罚参数
 mesh_file = "y_pipe.msh"   # 由 geometry_gmsh.py 生成的网格文件
 
@@ -37,7 +39,7 @@ volume_source = args.volume_source    # 施加均匀的体激励项到整个计�
 def spatial_source(x, y, z):
     # 这里可以定义任意空间分布的激励函数
     # 如果z<0.1, 激励为1Pa, 否则为0Pa
-    return volume_source if z < 0.01 else 0.0
+    return volume_source if x < 1 else 0.0
 
 print(f"[info] 使用空间变化的体激励项: {volume_source} Pa")
 
@@ -50,9 +52,9 @@ fem_solver = CoupledFEMSolver(mesh_file, frequency=frequency, cppenalty=penalty)
 # -------------------------------
 # 定义材料参数
 # -------------------------------
-E_init = jnp.log(3.0e9) / 10.0      # 杨氏模量 (Pa)
+E_init = jnp.log(3.0e9) / 20.0      # 杨氏模量 (Pa)
 nu_init = 0.35      # 泊松比
-rho_init = jnp.log(1400.0)   # 固体密度 (kg/m³)
+rho_init = jnp.log(1400.0)/6   # 固体密度 (kg/m³)
 
 # 单次运行模式
 if args.mode == 'single_run':
@@ -69,9 +71,9 @@ if args.mode == 'single_run':
     )
     
     print(f"[结果] 使用体激励项 {volume_source} Pa:")
-    print(f"  杨氏模量 E = {jnp.exp(10*E_init):.3e} Pa")
+    print(f"  杨氏模量 E = {jnp.exp(20*E_init):.3e} Pa")
     print(f"  泊松比 nu = {nu_init:.4f}")
-    print(f"  密度 rho_s = {jnp.exp(rho_init):.2f} kg/m³")
+    print(f"  密度 rho_s = {jnp.exp(6 * rho_init):.2f} kg/m³")
     print(f"  麦克风处声压 = {pred_pressure.item():.6e} Pa")
     # 可以保存解向量u以供后处理
     # np.save('solution_with_volume_source.npy', np.array(u))
@@ -86,6 +88,16 @@ params = {
     'E': jnp.array(E_init, dtype=jnp.float32),
     'nu': jnp.array(nu_init, dtype=jnp.float32),
     'rho_s': jnp.array(rho_init, dtype=jnp.float32)
+}
+
+# 初始化历史记录列表
+history = {
+    'epoch': [],
+    'loss': [],
+    'E': [],
+    'nu': [],
+    'rho_s': [],
+    'pred_pressure': []
 }
 
 # 设定目标：远端麦克风测量信号（例如 0.5 Pa）
@@ -124,15 +136,78 @@ def update(params, opt_state):
 
 # 优化循环
 print("[info] 开始优化")
+info_file = open("info.txt", "w")
 n_epochs = 100
 for epoch in range(n_epochs):
     params, opt_state, loss, pred_pressure = update(params, opt_state)
+
+    # 记录历史数据
+    current_E = jnp.exp(20*params['E'].item())
+    current_nu = params['nu'].item()
+    current_rho_s = jnp.exp(6 * params['rho_s'].item())
+    current_loss = loss.item()
+    current_pred_pressure = pred_pressure.item()
     
+    history['epoch'].append(epoch)
+    history['loss'].append(current_loss)
+    history['E'].append(current_E)
+    history['nu'].append(current_nu)
+    history['rho_s'].append(current_rho_s)
+    history['pred_pressure'].append(current_pred_pressure)
+
     if epoch % 1 == 0:
-        print(f"Epoch {epoch:03d}: Loss = {loss.item():.6e}, Predicted Far Pressure = {pred_pressure.item():.6e}")
-        print(f"   E = {jnp.exp(10*params['E'].item()):.3e} Pa, nu = {params['nu'].item():.4f}, rho_s = {jnp.exp(params['rho_s'].item()):.2f} kg/m³")
+        print(f"Epoch {epoch:03d}: Loss = {current_loss:.6e}, Predicted Far Pressure = {current_pred_pressure:.6e}")
+        print(f"   E = {current_E:.3e} Pa, nu = {current_nu:.4f}, rho_s = {current_rho_s:.2f} kg/m³")
+        info_file.write(f"Epoch {epoch:03d}: Loss = {current_loss:.6e}, Predicted Far Pressure = {current_pred_pressure:.6e}")
+        info_file.write(f"   E = {current_E:.3e} Pa, nu = {current_nu:.4f}, rho_s = {current_rho_s:.2f} kg/m³\n")
+    if os.path.exists("stop"):
+        print("[info] 检测到停止信号，提前结束优化")
+        break
 
 print("优化结束。最终参数：")
-print(f"  E = {jnp.exp(10*params['E'].item()):.3e} Pa")
+print(f"  E = {jnp.exp(20*params['E'].item()):.3e} Pa")
 print(f"  nu = {params['nu'].item():.4f}")
-print(f"  rho_s = {jnp.exp(params['rho_s'].item()):.2f} kg/m³")
+print(f"  rho_s = {jnp.exp(6*params['rho_s'].item()):.2f} kg/m³")
+
+# --- 可视化 --- 
+plt.figure(figsize=(12, 8))
+
+# Loss plot
+plt.subplot(2, 2, 1)
+plt.plot(history['epoch'], history['loss'], label='Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Optimization Loss over Epochs')
+plt.yscale('log') # Use log scale for better visibility if loss decreases rapidly
+plt.grid(True)
+plt.legend()
+
+# E plot
+plt.subplot(2, 2, 2)
+plt.plot(history['epoch'], history['E'], label='E (Pa)')
+plt.xlabel('Epoch')
+plt.ylabel("Young's Modulus (E)")
+plt.title("Young's Modulus over Epochs")
+plt.grid(True)
+plt.legend()
+
+# nu plot
+plt.subplot(2, 2, 3)
+plt.plot(history['epoch'], history['nu'], label='nu')
+plt.xlabel('Epoch')
+plt.ylabel("Poisson's Ratio (nu)")
+plt.title("Poisson's Ratio over Epochs")
+plt.grid(True)
+plt.legend()
+
+# rho_s plot
+plt.subplot(2, 2, 4)
+plt.plot(history['epoch'], history['rho_s'], label='rho_s (kg/m³)')
+plt.xlabel('Epoch')
+plt.ylabel('Solid Density (rho_s)')
+plt.title('Solid Density over Epochs')
+plt.grid(True)
+plt.legend()
+
+plt.tight_layout()
+plt.show()
